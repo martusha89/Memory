@@ -1,0 +1,24 @@
+# ─── Memory Server ─────────────────────────────────────────────────
+# Rename "memory-server" to whatever you want.
+# After creating your D1 database and Vectorize index, fill in the
+# database_id and index_name below.
+
+name = "memory-server"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# ─── Cloudflare AI (for embeddings) ───────────────────────────────
+[ai]
+binding = "AI"
+
+# ─── Vectorize (semantic search) ──────────────────────────────────
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "memory-index"  # Change to your Vectorize index name
+
+# ─── D1 Database ──────────────────────────────────────────────────
+[[d1_databases]]
+binding = "DB"
+database_name = "memory-db"          # Change to your D1 database name
+database_id = "YOUR_DATABASE_ID"     # Replace after running: npx wrangler d1 create memory-db
