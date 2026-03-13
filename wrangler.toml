@@ -33,7 +33,7 @@ index_name = "memory-index"  # Change to your Vectorize index name
 [[d1_databases]]
 binding = "DB"
 database_name = "memory-db"          # Change to your D1 database name
-database_id = "54697d10-6f24-4317-a5d8-7acb277597bf"
+database_id = "YOUR_DATABASE_ID"     # Replace after running: npx wrangler d1 create memory-db
 
 # ─── Nightly Consolidation (opt-in) ──────────────────────────────
 # Uncomment the lines below to enable automatic memory consolidation.
