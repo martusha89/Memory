@@ -8,7 +8,19 @@ main = "src/index.ts"
 compatibility_date = "2025-01-01"
 compatibility_flags = ["nodejs_compat"]
 
-# ─── Cloudflare AI (for embeddings) ───────────────────────────────
+# ─── Configuration ──────────────────────────────────────────────────
+[vars]
+# Behavior mode: "proactive" (default), "balanced", or "manual"
+# proactive = always recall at session start, store new info automatically
+# balanced  = recall when relevant, store key facts
+# manual    = only store/recall when explicitly asked
+MEMORY_BEHAVIOR = "proactive"
+
+# Categories (comma-separated). Defaults if not set:
+# people, preference, fact, project, health, date, technical, reflection, general
+# MEMORY_CATEGORIES = "people,preference,fact,project,health,date,technical,reflection,general"
+
+# ─── Cloudflare AI (for embeddings + consolidation) ────────────────
 [ai]
 binding = "AI"
 
@@ -21,4 +33,14 @@ index_name = "memory-index"  # Change to your Vectorize index name
 [[d1_databases]]
 binding = "DB"
 database_name = "memory-db"          # Change to your D1 database name
-database_id = "YOUR_DATABASE_ID"     # Replace after running: npx wrangler d1 create memory-db
+database_id = "54697d10-6f24-4317-a5d8-7acb277597bf"
+
+# ─── Nightly Consolidation (opt-in) ──────────────────────────────
+# Uncomment the lines below to enable automatic memory consolidation.
+# The cron job runs nightly and merges similar/duplicate memories using AI.
+# NOTE: This uses Workers AI (free tier: 10,000 neurons/day) and is
+# subject to the 50-subrequest limit on the free Workers plan.
+# Processes up to 20 clusters per run — catches up over multiple nights.
+#
+# [triggers]
+# crons = ["0 2 * * *"]  # 2:00 AM UTC — adjust to your timezone

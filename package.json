@@ -1,6 +1,6 @@
 {
   "name": "memory-server",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Persistent AI memory on Cloudflare — semantic search via MCP",
   "main": "src/index.ts",
   "scripts": {
@@ -11,7 +11,7 @@
     "db:schema:local": "wrangler d1 execute memory-db --local --file=schema.sql"
   },
   "keywords": ["mcp", "memory", "ai", "cloudflare", "semantic-search", "vectorize"],
-  "license": "MIT",
+  "license": "SEE LICENSE IN LICENSE",
   "type": "commonjs",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
