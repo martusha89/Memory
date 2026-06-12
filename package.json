@@ -1,6 +1,6 @@
 {
-  "name": "memory-server",
-  "version": "2.1.0",
+  "name": "@aidhd/memory-server",
+  "version": "2.2.0",
   "description": "Persistent AI memory on Cloudflare — semantic search via MCP",
   "main": "src/index.ts",
   "scripts": {

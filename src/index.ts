@@ -9,7 +9,6 @@ interface Env {
   DB: D1Database;
   MEMORY_SECRET: string;
   MEMORY_CATEGORIES?: string;
-  MEMORY_BEHAVIOR?: string;
 }
 
 interface Memory {
@@ -19,6 +18,7 @@ interface Memory {
   tags: string;
   importance: number;
   source: string;
+  pinned: number;
   access_count: number;
   last_accessed_at: string | null;
   consolidated_from: string | null;
@@ -27,9 +27,14 @@ interface Memory {
 }
 
 // ── Constants ─────────────────────────────────────────────────────────
+const VERSION = "2.2.0";
 const EMBEDDING_MODEL = "@cf/baai/bge-base-en-v1.5";
 const CONSOLIDATION_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast";
 const SIMILARITY_THRESHOLD = 0.85;
+// Vectorize always returns the topK nearest neighbors no matter how far
+// away they are — without a floor, recall returns junk and the keyword
+// fallback is unreachable.
+const MIN_RECALL_SCORE = 0.55;
 const STALE_DAYS = 90;
 const MAX_CONSOLIDATION_BATCHES = 20;
 
@@ -54,20 +59,12 @@ const SOURCES = [
   "unknown",
 ] as const;
 
-type BehaviorMode = "proactive" | "balanced" | "manual";
-
 // ── Helpers ───────────────────────────────────────────────────────────
 function getCategories(env: Env): string[] {
   if (env.MEMORY_CATEGORIES) {
     return env.MEMORY_CATEGORIES.split(",").map((c) => c.trim().toLowerCase());
   }
   return [...DEFAULT_CATEGORIES];
-}
-
-function getBehavior(env: Env): BehaviorMode {
-  const mode = env.MEMORY_BEHAVIOR?.toLowerCase();
-  if (mode === "balanced" || mode === "manual") return mode;
-  return "proactive";
 }
 
 async function embed(ai: Ai, text: string): Promise<number[]> {
@@ -83,6 +80,7 @@ function formatMemory(m: Memory) {
     tags: JSON.parse(m.tags || "[]"),
     importance: m.importance,
     source: m.source,
+    pinned: !!m.pinned,
     access_count: m.access_count,
     last_accessed_at: m.last_accessed_at,
     created_at: m.created_at,
@@ -91,6 +89,201 @@ function formatMemory(m: Memory) {
       ? JSON.parse(m.consolidated_from)
       : null,
   };
+}
+
+function intParam(
+  url: URL,
+  name: string,
+  def: number,
+  max?: number
+): number {
+  const raw = parseInt(url.searchParams.get(name) || "");
+  let val = Number.isFinite(raw) ? raw : def;
+  if (val < 0) val = def;
+  if (max !== undefined) val = Math.min(val, max);
+  return val;
+}
+
+async function touchAccess(db: D1Database, ids: number[]): Promise<void> {
+  if (ids.length === 0) return;
+  const ph = ids.map(() => "?").join(",");
+  await db
+    .prepare(
+      `UPDATE memories SET last_accessed_at = datetime('now'), access_count = access_count + 1 WHERE id IN (${ph})`
+    )
+    .bind(...ids)
+    .run();
+}
+
+// ── Shared Recall (used by REST + MCP) ───────────────────────────────
+async function recallMemories(
+  env: Env,
+  query: string,
+  category: string | undefined,
+  limit: number
+): Promise<any[]> {
+  const queryVector = await embed(env.AI, query);
+  const queryOptions: VectorizeQueryOptions = {
+    topK: limit,
+    returnMetadata: "all",
+  };
+  if (category) queryOptions.filter = { category };
+
+  const vectorResults = await env.VECTORIZE.query(queryVector, queryOptions);
+  const matches = (vectorResults.matches || []).filter(
+    (m) => m.score >= MIN_RECALL_SCORE
+  );
+
+  if (matches.length === 0) {
+    // Fallback: keyword search
+    let fallbackQuery = "SELECT * FROM memories WHERE content LIKE ?";
+    const fallbackBinds: any[] = [`%${query}%`];
+    if (category) {
+      fallbackQuery += " AND category = ?";
+      fallbackBinds.push(category);
+    }
+    fallbackQuery += " ORDER BY importance DESC, created_at DESC LIMIT ?";
+    fallbackBinds.push(limit);
+    const { results } = await env.DB.prepare(fallbackQuery)
+      .bind(...fallbackBinds)
+      .all();
+
+    if (!results || results.length === 0) return [];
+    await touchAccess(
+      env.DB,
+      (results as unknown as Memory[]).map((m) => m.id)
+    );
+    return (results as unknown as Memory[]).map((m) => ({
+      ...formatMemory(m),
+      score: null,
+      match_type: "keyword",
+    }));
+  }
+
+  // Fetch full records from D1
+  const ids = matches.map((m) => m.id);
+  const ph = ids.map(() => "?").join(",");
+  const { results: memories } = await env.DB.prepare(
+    `SELECT * FROM memories WHERE id IN (${ph})`
+  )
+    .bind(...ids)
+    .all();
+
+  await touchAccess(
+    env.DB,
+    ((memories as unknown as Memory[]) || []).map((m) => m.id)
+  );
+
+  return matches
+    .map((match) => {
+      const memory = (memories as unknown as Memory[])?.find(
+        (m) => m.id.toString() === match.id
+      );
+      if (!memory) return null;
+      const importanceBoost = memory.importance / 5;
+      const weightedScore = match.score * 0.7 + importanceBoost * 0.3;
+      return {
+        ...formatMemory(memory),
+        score: Math.round(match.score * 100) / 100,
+        weighted_score: Math.round(weightedScore * 100) / 100,
+        match_type: "semantic",
+      };
+    })
+    .filter(Boolean)
+    .sort((a: any, b: any) => b.weighted_score - a.weighted_score);
+}
+
+// ── Shared Dedup Check (used by REST + MCP) ──────────────────────────
+async function findDuplicate(
+  env: Env,
+  vector: number[]
+): Promise<{ memory: Memory; similarity: number } | null> {
+  const similar = await env.VECTORIZE.query(vector, {
+    topK: 3,
+    returnMetadata: "all",
+  });
+  const dupes = (similar.matches || []).filter(
+    (m) => m.score >= SIMILARITY_THRESHOLD
+  );
+  if (dupes.length === 0) return null;
+  const ids = dupes.map((d) => d.id);
+  const ph = ids.map(() => "?").join(",");
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM memories WHERE id IN (${ph})`
+  )
+    .bind(...ids)
+    .all();
+  const existing = (results as unknown as Memory[])[0];
+  if (!existing) return null;
+  return { memory: existing, similarity: dupes[0].score };
+}
+
+// ── Shared Stats (used by REST + MCP) ────────────────────────────────
+async function getStatsData(env: Env, categories: string[]) {
+  const [
+    total,
+    byCategory,
+    bySource,
+    byImportance,
+    staleCount,
+    oldest,
+    newest,
+    mostAccessed,
+  ] = await env.DB.batch([
+    env.DB.prepare("SELECT COUNT(*) as count FROM memories"),
+    env.DB.prepare(
+      "SELECT category, COUNT(*) as count FROM memories GROUP BY category ORDER BY count DESC"
+    ),
+    env.DB.prepare(
+      "SELECT source, COUNT(*) as count FROM memories GROUP BY source ORDER BY count DESC"
+    ),
+    env.DB.prepare(
+      "SELECT importance, COUNT(*) as count FROM memories GROUP BY importance ORDER BY importance DESC"
+    ),
+    env.DB.prepare(
+      `SELECT COUNT(*) as count FROM memories
+       WHERE (last_accessed_at IS NOT NULL AND last_accessed_at < datetime('now', '-90 days'))
+          OR (last_accessed_at IS NULL AND created_at < datetime('now', '-90 days'))`
+    ),
+    env.DB.prepare(
+      "SELECT created_at FROM memories ORDER BY created_at ASC LIMIT 1"
+    ),
+    env.DB.prepare(
+      "SELECT created_at FROM memories ORDER BY created_at DESC LIMIT 1"
+    ),
+    env.DB.prepare(
+      "SELECT id, content, access_count FROM memories ORDER BY access_count DESC LIMIT 3"
+    ),
+  ]);
+
+  return {
+    total_memories: (total.results[0] as any)?.count || 0,
+    by_category: byCategory.results,
+    by_source: bySource.results,
+    by_importance: byImportance.results,
+    stale_memories: (staleCount.results[0] as any)?.count || 0,
+    oldest_memory: (oldest.results[0] as any)?.created_at || null,
+    newest_memory: (newest.results[0] as any)?.created_at || null,
+    most_accessed: mostAccessed.results,
+    categories_configured: categories,
+  };
+}
+
+// ── Shared Stale Query (used by REST + MCP) ──────────────────────────
+async function getStaleMemories(
+  env: Env,
+  days: number,
+  limit: number
+): Promise<Memory[]> {
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM memories
+     WHERE (last_accessed_at IS NOT NULL AND last_accessed_at < datetime('now', ?))
+        OR (last_accessed_at IS NULL AND created_at < datetime('now', ?))
+     ORDER BY importance ASC, created_at ASC LIMIT ?`
+  )
+    .bind(`-${days} days`, `-${days} days`, limit)
+    .all();
+  return results as unknown as Memory[];
 }
 
 // ── CORS & Response Helpers ──────────────────────────────────────────
@@ -126,71 +319,20 @@ async function handleApi(
 
   // GET /api/categories
   if (path === "/api/categories" && method === "GET") {
-    return jsonResp({ categories, behavior: getBehavior(env) }, request);
+    return jsonResp({ categories }, request);
   }
 
   // GET /api/stats
   if (path === "/api/stats" && method === "GET") {
-    const total = await env.DB.prepare(
-      "SELECT COUNT(*) as count FROM memories"
-    ).first<{ count: number }>();
-    const byCategory = await env.DB.prepare(
-      "SELECT category, COUNT(*) as count FROM memories GROUP BY category ORDER BY count DESC"
-    ).all();
-    const bySource = await env.DB.prepare(
-      "SELECT source, COUNT(*) as count FROM memories GROUP BY source ORDER BY count DESC"
-    ).all();
-    const byImportance = await env.DB.prepare(
-      "SELECT importance, COUNT(*) as count FROM memories GROUP BY importance ORDER BY importance DESC"
-    ).all();
-    const staleCount = await env.DB.prepare(
-      `SELECT COUNT(*) as count FROM memories
-       WHERE (last_accessed_at IS NOT NULL AND last_accessed_at < datetime('now', '-90 days'))
-          OR (last_accessed_at IS NULL AND created_at < datetime('now', '-90 days'))`
-    ).first<{ count: number }>();
-    const oldest = await env.DB.prepare(
-      "SELECT created_at FROM memories ORDER BY created_at ASC LIMIT 1"
-    ).first<{ created_at: string }>();
-    const newest = await env.DB.prepare(
-      "SELECT created_at FROM memories ORDER BY created_at DESC LIMIT 1"
-    ).first<{ created_at: string }>();
-    const mostAccessed = await env.DB.prepare(
-      "SELECT id, content, access_count FROM memories ORDER BY access_count DESC LIMIT 3"
-    ).all();
-
-    return jsonResp(
-      {
-        total_memories: total?.count || 0,
-        by_category: byCategory.results,
-        by_source: bySource.results,
-        by_importance: byImportance.results,
-        stale_memories: staleCount?.count || 0,
-        oldest_memory: oldest?.created_at || null,
-        newest_memory: newest?.created_at || null,
-        most_accessed: mostAccessed.results,
-        behavior_mode: getBehavior(env),
-        categories_configured: categories,
-      },
-      request
-    );
+    return jsonResp(await getStatsData(env, categories), request);
   }
 
   // GET /api/stale?days=90&limit=20
   if (path === "/api/stale" && method === "GET") {
-    const days = parseInt(url.searchParams.get("days") || "90");
-    const limit = Math.min(
-      parseInt(url.searchParams.get("limit") || "20"),
-      50
-    );
-    const { results } = await env.DB.prepare(
-      `SELECT * FROM memories
-       WHERE (last_accessed_at IS NOT NULL AND last_accessed_at < datetime('now', ?))
-          OR (last_accessed_at IS NULL AND created_at < datetime('now', ?))
-       ORDER BY importance ASC, created_at ASC LIMIT ?`
-    )
-      .bind(`-${days} days`, `-${days} days`, limit)
-      .all();
-    return jsonResp((results as Memory[]).map(formatMemory), request);
+    const days = intParam(url, "days", 90);
+    const limit = intParam(url, "limit", 20, 50);
+    const results = await getStaleMemories(env, days, limit);
+    return jsonResp(results.map(formatMemory), request);
   }
 
   // POST /api/recall
@@ -207,88 +349,7 @@ async function handleApi(
       );
     }
 
-    const queryVector = await embed(env.AI, query);
-    const queryOptions: VectorizeQueryOptions = {
-      topK: limit,
-      returnMetadata: "all",
-    };
-    if (category) queryOptions.filter = { category };
-
-    const vectorResults = await env.VECTORIZE.query(queryVector, queryOptions);
-
-    if (!vectorResults.matches || vectorResults.matches.length === 0) {
-      // Fallback: keyword search
-      let fallbackQuery = "SELECT * FROM memories WHERE content LIKE ?";
-      const fallbackBinds: any[] = [`%${query}%`];
-      if (category) {
-        fallbackQuery += " AND category = ?";
-        fallbackBinds.push(category);
-      }
-      fallbackQuery +=
-        " ORDER BY importance DESC, created_at DESC LIMIT ?";
-      fallbackBinds.push(limit);
-      const { results } = await env.DB.prepare(fallbackQuery)
-        .bind(...fallbackBinds)
-        .all();
-
-      if (results && results.length > 0) {
-        const ids = (results as Memory[]).map((m) => m.id);
-        const ph = ids.map(() => "?").join(",");
-        await env.DB.prepare(
-          `UPDATE memories SET last_accessed_at = datetime('now'), access_count = access_count + 1 WHERE id IN (${ph})`
-        )
-          .bind(...ids)
-          .run();
-        return jsonResp(
-          (results as Memory[]).map((m) => ({
-            ...formatMemory(m),
-            score: null,
-            match_type: "keyword",
-          })),
-          request
-        );
-      }
-      return jsonResp([], request);
-    }
-
-    // Fetch full records from D1
-    const ids = vectorResults.matches.map((m) => m.id);
-    const ph = ids.map(() => "?").join(",");
-    const { results: memories } = await env.DB.prepare(
-      `SELECT * FROM memories WHERE id IN (${ph})`
-    )
-      .bind(...ids)
-      .all();
-
-    if (memories && memories.length > 0) {
-      const memIds = (memories as Memory[]).map((m) => m.id);
-      const mph = memIds.map(() => "?").join(",");
-      await env.DB.prepare(
-        `UPDATE memories SET last_accessed_at = datetime('now'), access_count = access_count + 1 WHERE id IN (${mph})`
-      )
-        .bind(...memIds)
-        .run();
-    }
-
-    const enriched = vectorResults.matches
-      .map((match) => {
-        const memory = (memories as Memory[])?.find(
-          (m) => m.id.toString() === match.id
-        );
-        if (!memory) return null;
-        const importanceBoost = memory.importance / 5;
-        const weightedScore = match.score * 0.7 + importanceBoost * 0.3;
-        return {
-          ...formatMemory(memory),
-          score: Math.round(match.score * 100) / 100,
-          weighted_score: Math.round(weightedScore * 100) / 100,
-          match_type: "semantic",
-        };
-      })
-      .filter(Boolean)
-      .sort((a: any, b: any) => b.weighted_score - a.weighted_score);
-
-    return jsonResp(enriched, request);
+    return jsonResp(await recallMemories(env, query, category, limit), request);
   }
 
   // ── Memory CRUD: /api/memories ────────────────────────────────────
@@ -299,11 +360,8 @@ async function handleApi(
     // GET /api/memories — list with pagination
     if (method === "GET" && !id) {
       const category = url.searchParams.get("category");
-      const limit = Math.min(
-        parseInt(url.searchParams.get("limit") || "50"),
-        100
-      );
-      const offset = parseInt(url.searchParams.get("offset") || "0");
+      const limit = intParam(url, "limit", 50, 100);
+      const offset = intParam(url, "offset", 0);
       const sort = url.searchParams.get("sort") || "created_at";
       const order =
         url.searchParams.get("order") === "asc" ? "ASC" : "DESC";
@@ -343,7 +401,7 @@ async function handleApi(
 
       return jsonResp(
         {
-          memories: (results as Memory[]).map(formatMemory),
+          memories: (results as unknown as Memory[]).map(formatMemory),
           total: total?.count || 0,
           limit,
           offset,
@@ -387,45 +445,36 @@ async function handleApi(
 
       // Dedup check
       if (!force) {
-        const similar = await env.VECTORIZE.query(vector, {
-          topK: 3,
-          returnMetadata: "all",
-        });
-        if (similar.matches?.length) {
-          const dupes = similar.matches.filter(
-            (m) => m.score >= SIMILARITY_THRESHOLD
+        const dupe = await findDuplicate(env, vector);
+        if (dupe) {
+          return jsonResp(
+            {
+              duplicate: true,
+              existing_id: dupe.memory.id,
+              existing_content: dupe.memory.content,
+              similarity: Math.round(dupe.similarity * 100),
+              message:
+                "Similar memory exists. Send force=true to store anyway.",
+            },
+            request,
+            409
           );
-          if (dupes.length > 0) {
-            const dupeIds = dupes.map((d) => d.id);
-            const dph = dupeIds.map(() => "?").join(",");
-            const { results } = await env.DB.prepare(
-              `SELECT id, content, category FROM memories WHERE id IN (${dph})`
-            )
-              .bind(...dupeIds)
-              .all();
-            const existing = (results as Memory[])[0];
-            if (existing) {
-              return jsonResp(
-                {
-                  duplicate: true,
-                  existing_id: existing.id,
-                  existing_content: existing.content,
-                  similarity: Math.round(dupes[0].score * 100),
-                  message:
-                    "Similar memory exists. Send force=true to store anyway.",
-                },
-                request,
-                409
-              );
-            }
-          }
         }
       }
 
+      // force=true means "I know it looks similar, keep it separate" —
+      // pin it so nightly consolidation never merges it away.
       const result = await env.DB.prepare(
-        "INSERT INTO memories (content, category, tags, importance, source) VALUES (?, ?, ?, ?, ?) RETURNING *"
+        "INSERT INTO memories (content, category, tags, importance, source, pinned) VALUES (?, ?, ?, ?, ?, ?) RETURNING *"
       )
-        .bind(content, category, JSON.stringify(tags), importance, source)
+        .bind(
+          content,
+          category,
+          JSON.stringify(tags),
+          importance,
+          source,
+          force ? 1 : 0
+        )
         .first<Memory>();
 
       if (!result)
@@ -477,7 +526,14 @@ async function handleApi(
         .bind(newContent, newCategory, newTags, newImportance, id)
         .run();
 
-      if (content) {
+      // Re-upsert when content OR vector metadata changed — Vectorize has
+      // no metadata-only update, and stale category metadata silently
+      // breaks category-filtered recall.
+      if (
+        content ||
+        newCategory !== existing.category ||
+        newImportance !== existing.importance
+      ) {
         const vector = await embed(env.AI, newContent);
         await env.VECTORIZE.upsert([
           {
@@ -533,61 +589,32 @@ async function handleApi(
     )
       .bind(`%"${tag}"%`, limit)
       .all();
-    return jsonResp((results as Memory[]).map(formatMemory), request);
+    return jsonResp((results as unknown as Memory[]).map(formatMemory), request);
   }
 
   return apiError("Not found", request, 404);
 }
 
-// ── Tool Descriptions by Behavior Mode ────────────────────────────────
-function descriptions(mode: BehaviorMode) {
-  const base = {
-    store_memory: {
-      proactive:
-        "Proactively store important information whenever you learn something new about the user — preferences, facts, decisions, people, health details, project context. Do NOT wait to be asked. If it's worth remembering, store it immediately. Duplicates are caught automatically.",
-      balanced:
-        "Store key facts, preferences, and decisions when they come up in conversation. Focus on information that would be useful in future sessions.",
-      manual:
-        "Store a memory. Only use this when the user explicitly asks you to remember something.",
-    },
-    recall: {
-      proactive:
-        "Search memories by meaning. Call this at the START of every conversation to check for relevant context. Also call it whenever the user asks something that might relate to past conversations. Use natural language queries.",
-      balanced:
-        "Search memories by meaning when the current topic might benefit from past context. Use natural language queries like 'what does the user prefer for X'.",
-      manual:
-        "Search memories by meaning. Use when the user asks you to recall or look up something they previously stored.",
-    },
-    update_memory:
-      "Update an existing memory's content, category, tags, or importance. Use this when you learn new details about something already stored — don't create duplicates, update the existing memory instead. The memory is re-embedded automatically.",
-    review_stale:
-      "List memories that haven't been accessed in a while. Use this to help the user clean up old, potentially outdated memories. Returns memories not recalled in the specified number of days.",
-    memory_stats:
-      "Get statistics about the memory store — total count, breakdown by category and source, importance distribution, stale memory count, and storage health.",
-  };
-
-  return {
-    store: base.store_memory[mode],
-    recall: base.recall[mode],
-    update: base.update_memory,
-    review_stale: base.review_stale,
-    stats: base.memory_stats,
-  };
-}
+// ── Tool Descriptions ─────────────────────────────────────────────────
+const TOOL_DESC = {
+  store: "Store a memory — facts, preferences, decisions, people, health details, project context. Duplicates are caught automatically (cosine similarity > 0.85).",
+  recall: "Search memories by meaning, weighted by importance. Use natural language queries like 'what does the user prefer for X'. Falls back to keyword search if no semantic matches.",
+  update: "Update an existing memory's content, category, tags, or importance. Use this when you learn new details about something already stored — don't create duplicates, update the existing memory instead. Re-embeds automatically.",
+  review_stale: "List memories that haven't been accessed in a while. Use this to help the user clean up old, potentially outdated memories. Returns memories not recalled in the specified number of days.",
+  stats: "Get statistics about the memory store — total count, breakdown by category and source, importance distribution, stale memory count, and storage health.",
+};
 
 // ── MCP Server ────────────────────────────────────────────────────────
 function createServer(env: Env) {
   const server = new McpServer({
     name: "Memory",
-    version: "2.0.0",
+    version: VERSION,
   });
 
   const categories = getCategories(env);
-  const mode = getBehavior(env);
-  const desc = descriptions(mode);
 
   // ── store_memory ──────────────────────────────────────────────────
-  server.tool("store_memory", desc.store, {
+  server.tool("store_memory", TOOL_DESC.store, {
     content: z.string().describe("The memory content to store"),
     category: z
       .string()
@@ -631,44 +658,32 @@ function createServer(env: Env) {
 
     // Dedup check
     if (!force) {
-      const similar = await env.VECTORIZE.query(vector, {
-        topK: 3,
-        returnMetadata: "all",
-      });
-
-      if (similar.matches && similar.matches.length > 0) {
-        const dupes = similar.matches.filter(
-          (m) => m.score >= SIMILARITY_THRESHOLD
-        );
-        if (dupes.length > 0) {
-          const ids = dupes.map((d) => d.id);
-          const placeholders = ids.map(() => "?").join(",");
-          const { results } = await env.DB.prepare(
-            `SELECT id, content, category FROM memories WHERE id IN (${placeholders})`
-          )
-            .bind(...ids)
-            .all();
-
-          const existing = (results as Memory[])[0];
-          if (existing) {
-            return {
-              content: [
-                {
-                  type: "text" as const,
-                  text: `Similar memory already exists (id: ${existing.id}, similarity: ${Math.round(dupes[0].score * 100)}%):\n"${existing.content}"\n\nUse update_memory to modify it, or call store_memory with force=true to store anyway.`,
-                },
-              ],
-            };
-          }
-        }
+      const dupe = await findDuplicate(env, vector);
+      if (dupe) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Similar memory already exists (id: ${dupe.memory.id}, similarity: ${Math.round(dupe.similarity * 100)}%):\n"${dupe.memory.content}"\n\nUse update_memory to modify it, or call store_memory with force=true to store anyway.`,
+            },
+          ],
+        };
       }
     }
 
-    // Insert into D1
+    // Insert into D1 — force=true pins the memory so nightly
+    // consolidation never merges it away.
     const result = await env.DB.prepare(
-      "INSERT INTO memories (content, category, tags, importance, source) VALUES (?, ?, ?, ?, ?) RETURNING id"
+      "INSERT INTO memories (content, category, tags, importance, source, pinned) VALUES (?, ?, ?, ?, ?, ?) RETURNING id"
     )
-      .bind(content, category, JSON.stringify(tags), importance, source)
+      .bind(
+        content,
+        category,
+        JSON.stringify(tags),
+        importance,
+        source,
+        force ? 1 : 0
+      )
       .first<{ id: number }>();
 
     if (!result) {
@@ -699,7 +714,7 @@ function createServer(env: Env) {
   });
 
   // ── update_memory ─────────────────────────────────────────────────
-  server.tool("update_memory", desc.update, {
+  server.tool("update_memory", TOOL_DESC.update, {
     id: z.number().describe("The memory ID to update"),
     content: z
       .string()
@@ -760,8 +775,13 @@ function createServer(env: Env) {
       .bind(newContent, newCategory, newTags, newImportance, id)
       .run();
 
-    // Re-embed if content changed
-    if (content) {
+    // Re-upsert when content OR vector metadata changed — stale category
+    // metadata silently breaks category-filtered recall.
+    const needsUpsert =
+      !!content ||
+      newCategory !== existing.category ||
+      newImportance !== existing.importance;
+    if (needsUpsert) {
       const vector = await embed(env.AI, newContent);
       await env.VECTORIZE.upsert([
         {
@@ -781,14 +801,14 @@ function createServer(env: Env) {
       content: [
         {
           type: "text" as const,
-          text: `Memory ${id} updated.${content ? " (re-embedded)" : ""}`,
+          text: `Memory ${id} updated.${needsUpsert ? " (re-embedded)" : ""}`,
         },
       ],
     };
   });
 
   // ── recall ────────────────────────────────────────────────────────
-  server.tool("recall", desc.recall, {
+  server.tool("recall", TOOL_DESC.recall, {
     query: z.string().describe("Natural language search query"),
     category: z
       .string()
@@ -812,114 +832,16 @@ function createServer(env: Env) {
       };
     }
 
-    const queryVector = await embed(env.AI, query);
-
-    const queryOptions: VectorizeQueryOptions = {
-      topK: limit,
-      returnMetadata: "all",
-    };
-    if (category) {
-      queryOptions.filter = { category };
-    }
-
-    const vectorResults = await env.VECTORIZE.query(queryVector, queryOptions);
-
-    if (!vectorResults.matches || vectorResults.matches.length === 0) {
-      // Fallback: keyword search
-      let fallbackQuery = "SELECT * FROM memories WHERE content LIKE ?";
-      const fallbackBinds: any[] = [`%${query}%`];
-
-      if (category) {
-        fallbackQuery += " AND category = ?";
-        fallbackBinds.push(category);
-      }
-
-      fallbackQuery += " ORDER BY importance DESC, created_at DESC LIMIT ?";
-      fallbackBinds.push(limit);
-
-      const { results: fallbackResults } = await env.DB.prepare(fallbackQuery)
-        .bind(...fallbackBinds)
-        .all();
-
-      if (fallbackResults && fallbackResults.length > 0) {
-        // Update access tracking
-        const ids = (fallbackResults as Memory[]).map((m) => m.id);
-        const placeholders = ids.map(() => "?").join(",");
-        await env.DB.prepare(
-          `UPDATE memories SET last_accessed_at = datetime('now'), access_count = access_count + 1 WHERE id IN (${placeholders})`
-        )
-          .bind(...ids)
-          .run();
-
-        const formatted = (fallbackResults as Memory[]).map((m) => ({
-          ...formatMemory(m),
-          score: "keyword_match",
-        }));
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(formatted, null, 2),
-            },
-          ],
-        };
-      }
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: "No memories found matching that query.",
-          },
-        ],
-      };
-    }
-
-    // Fetch full records
-    const ids = vectorResults.matches.map((m) => m.id);
-    const placeholders = ids.map(() => "?").join(",");
-    const { results: memories } = await env.DB.prepare(
-      `SELECT * FROM memories WHERE id IN (${placeholders})`
-    )
-      .bind(...ids)
-      .all();
-
-    // Update access tracking
-    if (memories && memories.length > 0) {
-      const memIds = (memories as Memory[]).map((m) => m.id);
-      const memPlaceholders = memIds.map(() => "?").join(",");
-      await env.DB.prepare(
-        `UPDATE memories SET last_accessed_at = datetime('now'), access_count = access_count + 1 WHERE id IN (${memPlaceholders})`
-      )
-        .bind(...memIds)
-        .run();
-    }
-
-    // Enrich with scores and sort by importance-weighted score
-    const enriched = vectorResults.matches
-      .map((match) => {
-        const memory = (memories as Memory[])?.find(
-          (m) => m.id.toString() === match.id
-        );
-        if (!memory) return null;
-        const importanceBoost = memory.importance / 5;
-        const weightedScore =
-          match.score * 0.7 + importanceBoost * 0.3;
-        return {
-          ...formatMemory(memory),
-          score: Math.round(match.score * 100) / 100,
-          weighted_score: Math.round(weightedScore * 100) / 100,
-        };
-      })
-      .filter(Boolean)
-      .sort((a: any, b: any) => b.weighted_score - a.weighted_score);
+    const results = await recallMemories(env, query, category, limit);
 
     return {
       content: [
         {
           type: "text" as const,
-          text: JSON.stringify(enriched, null, 2),
+          text:
+            results.length > 0
+              ? JSON.stringify(results, null, 2)
+              : "No memories found matching that query.",
         },
       ],
     };
@@ -964,7 +886,7 @@ function createServer(env: Env) {
       binds.push(limit);
 
       const { results } = await env.DB.prepare(query).bind(...binds).all();
-      const formatted = (results as Memory[]).map(formatMemory);
+      const formatted = (results as unknown as Memory[]).map(formatMemory);
 
       return {
         content: [
@@ -1000,7 +922,7 @@ function createServer(env: Env) {
         .bind(`%"${tag}"%`, limit)
         .all();
 
-      const formatted = (results as Memory[]).map(formatMemory);
+      const formatted = (results as unknown as Memory[]).map(formatMemory);
 
       return {
         content: [
@@ -1050,7 +972,7 @@ function createServer(env: Env) {
   );
 
   // ── review_stale ──────────────────────────────────────────────────
-  server.tool("review_stale", desc.review_stale, {
+  server.tool("review_stale", TOOL_DESC.review_stale, {
     days: z
       .number()
       .min(1)
@@ -1063,17 +985,8 @@ function createServer(env: Env) {
       .default(20)
       .describe("Number of stale memories to return"),
   }, async ({ days, limit }) => {
-    const { results } = await env.DB.prepare(
-      `SELECT * FROM memories
-       WHERE (last_accessed_at IS NOT NULL AND last_accessed_at < datetime('now', ?))
-          OR (last_accessed_at IS NULL AND created_at < datetime('now', ?))
-       ORDER BY importance ASC, created_at ASC
-       LIMIT ?`
-    )
-      .bind(`-${days} days`, `-${days} days`, limit)
-      .all();
-
-    const formatted = (results as Memory[]).map(formatMemory);
+    const results = await getStaleMemories(env, days, limit);
+    const formatted = results.map(formatMemory);
 
     return {
       content: [
@@ -1089,53 +1002,8 @@ function createServer(env: Env) {
   });
 
   // ── memory_stats ──────────────────────────────────────────────────
-  server.tool("memory_stats", desc.stats, {}, async () => {
-    const total = await env.DB.prepare(
-      "SELECT COUNT(*) as count FROM memories"
-    ).first<{ count: number }>();
-
-    const byCategory = await env.DB.prepare(
-      "SELECT category, COUNT(*) as count FROM memories GROUP BY category ORDER BY count DESC"
-    ).all();
-
-    const bySource = await env.DB.prepare(
-      "SELECT source, COUNT(*) as count FROM memories GROUP BY source ORDER BY count DESC"
-    ).all();
-
-    const byImportance = await env.DB.prepare(
-      "SELECT importance, COUNT(*) as count FROM memories GROUP BY importance ORDER BY importance DESC"
-    ).all();
-
-    const staleCount = await env.DB.prepare(
-      `SELECT COUNT(*) as count FROM memories
-       WHERE (last_accessed_at IS NOT NULL AND last_accessed_at < datetime('now', '-90 days'))
-          OR (last_accessed_at IS NULL AND created_at < datetime('now', '-90 days'))`
-    ).first<{ count: number }>();
-
-    const oldest = await env.DB.prepare(
-      "SELECT created_at FROM memories ORDER BY created_at ASC LIMIT 1"
-    ).first<{ created_at: string }>();
-
-    const newest = await env.DB.prepare(
-      "SELECT created_at FROM memories ORDER BY created_at DESC LIMIT 1"
-    ).first<{ created_at: string }>();
-
-    const mostAccessed = await env.DB.prepare(
-      "SELECT id, content, access_count FROM memories ORDER BY access_count DESC LIMIT 3"
-    ).all();
-
-    const stats = {
-      total_memories: total?.count || 0,
-      by_category: byCategory.results,
-      by_source: bySource.results,
-      by_importance: byImportance.results,
-      stale_memories: staleCount?.count || 0,
-      oldest_memory: oldest?.created_at || null,
-      newest_memory: newest?.created_at || null,
-      most_accessed: mostAccessed.results,
-      behavior_mode: mode,
-      categories_configured: categories,
-    };
+  server.tool("memory_stats", TOOL_DESC.stats, {}, async () => {
+    const stats = await getStatsData(env, categories);
 
     return {
       content: [
@@ -1143,57 +1011,6 @@ function createServer(env: Env) {
       ],
     };
   });
-
-  // ── MCP Prompt: memory-instructions ───────────────────────────────
-  const promptText = {
-    proactive: `You have access to a persistent memory store that remembers things across conversations.
-
-**At the start of every conversation:**
-- Call recall() with context about what the user is discussing to check for relevant memories
-- Reference relevant memories naturally — don't list them mechanically
-
-**During conversation:**
-- When you learn something new about the user (preferences, facts, people, health, projects), store it immediately with store_memory()
-- When the user corrects previous information, use update_memory() on the existing memory — don't create duplicates
-- Assign importance thoughtfully: 5 for critical info (allergies, key decisions), 3 for normal facts, 1 for trivia
-
-**Before ending a session:**
-- Store any key facts, preferences, or decisions that came up
-- If the user shared something personal or important, make sure it's stored
-
-Available categories: ${categories.join(", ")}`,
-
-    balanced: `You have access to a persistent memory store.
-
-- Use recall() when the current topic might benefit from past context
-- Store key facts and preferences with store_memory() when they come up naturally
-- Use update_memory() to modify existing memories rather than creating duplicates
-- Importance: 5=critical, 3=normal, 1=trivial
-
-Available categories: ${categories.join(", ")}`,
-
-    manual: `You have access to a persistent memory store. Use it only when the user explicitly asks you to remember or recall something.
-
-Available tools: store_memory, recall, update_memory, list_recent, search_by_tag, forget, review_stale, memory_stats
-Available categories: ${categories.join(", ")}`,
-  };
-
-  server.prompt(
-    "memory-instructions",
-    "Instructions for how to use the memory server. Read this at the start of every session.",
-    {},
-    async () => ({
-      messages: [
-        {
-          role: "user" as const,
-          content: {
-            type: "text" as const,
-            text: promptText[mode],
-          },
-        },
-      ],
-    })
-  );
 
   return server;
 }
@@ -1203,23 +1020,27 @@ async function runConsolidation(env: Env) {
   const processed = new Set<string>();
   let mergeCount = 0;
 
-  // Get all memory IDs
+  // Pinned memories (stored with force=true) are explicit "keep these
+  // separate" decisions — consolidation never touches them.
   const { results: allMemories } = await env.DB.prepare(
-    "SELECT id, content, category, importance FROM memories ORDER BY created_at DESC"
+    "SELECT id, category FROM memories WHERE pinned = 0 ORDER BY created_at DESC"
   ).all();
 
   if (!allMemories || allMemories.length < 2) return;
 
-  for (const memory of allMemories as Memory[]) {
+  for (const memory of allMemories as unknown as Memory[]) {
     if (processed.has(memory.id.toString())) continue;
     if (mergeCount >= MAX_CONSOLIDATION_BATCHES) break;
 
-    // Find similar memories using the stored vector
+    // Find similar memories using the stored vector. Same-category only —
+    // a health memory must never get merged into a technical one just
+    // because the embeddings sit close.
     let similar;
     try {
-      similar = await env.VECTORIZE.queryById(memory.id.toString(), {
+      similar = await (env.VECTORIZE as any).queryById(memory.id.toString(), {
         topK: 5,
         returnMetadata: "all",
+        filter: { category: memory.category },
       });
     } catch {
       continue;
@@ -1228,7 +1049,7 @@ async function runConsolidation(env: Env) {
     if (!similar.matches) continue;
 
     // Filter for high similarity, excluding self and already-processed
-    const cluster = similar.matches.filter(
+    const cluster = (similar.matches as VectorizeMatch[]).filter(
       (m) =>
         m.id !== memory.id.toString() &&
         m.score >= SIMILARITY_THRESHOLD &&
@@ -1237,25 +1058,26 @@ async function runConsolidation(env: Env) {
 
     if (cluster.length === 0) continue;
 
-    // Fetch full content for cluster members
+    // Fetch full content for cluster members (re-check pinned + category
+    // in D1 — Vectorize metadata can lag)
     const clusterIds = [memory.id.toString(), ...cluster.map((c) => c.id)];
     const placeholders = clusterIds.map(() => "?").join(",");
     const { results: clusterMemories } = await env.DB.prepare(
-      `SELECT * FROM memories WHERE id IN (${placeholders})`
+      `SELECT * FROM memories WHERE id IN (${placeholders}) AND pinned = 0 AND category = ?`
     )
-      .bind(...clusterIds)
+      .bind(...clusterIds, memory.category)
       .all();
 
     if (!clusterMemories || clusterMemories.length < 2) continue;
 
     // Merge via Workers AI
-    const memoriesText = (clusterMemories as Memory[])
+    const memoriesText = (clusterMemories as unknown as Memory[])
       .map((m) => `- ${m.content} [importance: ${m.importance}]`)
       .join("\n");
 
     let merged: string;
     try {
-      const aiResponse = await env.AI.run(CONSOLIDATION_MODEL, {
+      const aiResponse = await env.AI.run(CONSOLIDATION_MODEL as any, {
         messages: [
           {
             role: "system",
@@ -1279,26 +1101,39 @@ async function runConsolidation(env: Env) {
 
     // Determine merged metadata
     const maxImportance = Math.max(
-      ...(clusterMemories as Memory[]).map((m) => m.importance)
+      ...(clusterMemories as unknown as Memory[]).map((m) => m.importance)
     );
     const primaryCategory = memory.category;
     const allTags = new Set<string>();
-    for (const m of clusterMemories as Memory[]) {
+    for (const m of clusterMemories as unknown as Memory[]) {
       for (const t of JSON.parse(m.tags || "[]")) {
         allTags.add(t);
       }
     }
 
+    // Carry access stats forward so stale tracking survives the merge
+    const maxAccessCount = Math.max(
+      ...(clusterMemories as unknown as Memory[]).map((m) => m.access_count)
+    );
+    const lastAccessed =
+      (clusterMemories as unknown as Memory[])
+        .map((m) => m.last_accessed_at)
+        .filter(Boolean)
+        .sort()
+        .pop() || null;
+
     // Insert consolidated memory
     const result = await env.DB.prepare(
-      "INSERT INTO memories (content, category, tags, importance, source, consolidated_from) VALUES (?, ?, ?, ?, 'consolidation', ?) RETURNING id"
+      "INSERT INTO memories (content, category, tags, importance, source, consolidated_from, access_count, last_accessed_at) VALUES (?, ?, ?, ?, 'consolidation', ?, ?, ?) RETURNING id"
     )
       .bind(
         merged,
         primaryCategory,
         JSON.stringify([...allTags]),
         maxImportance,
-        JSON.stringify(clusterIds.map(Number))
+        JSON.stringify((clusterMemories as unknown as Memory[]).map((m) => m.id)),
+        maxAccessCount,
+        lastAccessed
       )
       .first<{ id: number }>();
 
@@ -1319,15 +1154,25 @@ async function runConsolidation(env: Env) {
       },
     ]);
 
-    // Delete old entries
-    for (const cId of clusterIds) {
-      await env.DB.prepare("DELETE FROM memories WHERE id = ?")
-        .bind(Number(cId))
+    // Archive originals before removing them — an 8B merge can drop
+    // details, and without the archive that information is gone forever.
+    // Only touch rows that actually passed the pinned/category re-check.
+    const mergedIds = (clusterMemories as unknown as Memory[]).map((m) => m.id);
+    for (const mId of mergedIds) {
+      await env.DB.prepare(
+        `INSERT INTO memories_archive (original_id, content, category, tags, importance, source, access_count, last_accessed_at, created_at, consolidated_into)
+         SELECT id, content, category, tags, importance, source, access_count, last_accessed_at, created_at, ? FROM memories WHERE id = ?`
+      )
+        .bind(result.id, mId)
         .run();
-      await env.VECTORIZE.deleteByIds([cId]);
+      await env.DB.prepare("DELETE FROM memories WHERE id = ?")
+        .bind(mId)
+        .run();
+      await env.VECTORIZE.deleteByIds([mId.toString()]);
     }
 
-    // Mark as processed
+    // Mark as processed (including cluster members that were filtered out
+    // by the re-check, so we don't re-cluster them this run)
     for (const cId of clusterIds) {
       processed.add(cId);
     }
@@ -1338,7 +1183,17 @@ async function runConsolidation(env: Env) {
 
 // ── Auth Middleware ────────────────────────────────────────────────────
 function checkAuth(request: Request, env: Env): Response | null {
-  if (!env.MEMORY_SECRET) return null;
+  // Fail CLOSED: a missing secret must never mean an open server.
+  if (!env.MEMORY_SECRET) {
+    return jsonResp(
+      {
+        error:
+          "Server not configured: set MEMORY_SECRET (wrangler secret put MEMORY_SECRET)",
+      },
+      request,
+      503
+    );
+  }
 
   const url = new URL(request.url);
   const authHeader = request.headers.get("Authorization");
@@ -1347,7 +1202,7 @@ function checkAuth(request: Request, env: Env): Response | null {
   const token = authHeader?.replace("Bearer ", "") || querySecret;
 
   if (token !== env.MEMORY_SECRET) {
-    return new Response("Unauthorized", { status: 401 });
+    return jsonResp({ error: "Unauthorized" }, request, 401);
   }
 
   return null;
@@ -1528,7 +1383,6 @@ textarea{resize:vertical;min-height:80px}
 <script>
 let BASE='';let SECRET='';let CATEGORIES=[];let ALL_MEMORIES=[];let CURRENT_CAT=null;let EDITING_ID=null;let IMPORTANCE=3;let IS_SEARCH=false;
 
-function isEmbedded(){return !window.location.search.includes('remote=1')&&!document.getElementById('remoteFields').style.display!=='none'||window.location.pathname==='/'}
 function getBase(){return BASE||window.location.origin}
 
 function toggleRemote(){
@@ -1775,8 +1629,7 @@ export default {
         JSON.stringify({
           status: "ok",
           name: "Memory",
-          version: "2.1.0",
-          behavior: getBehavior(env),
+          version: VERSION,
           categories: getCategories(env),
         }),
         { headers: { "content-type": "application/json" } }
@@ -1796,19 +1649,18 @@ export default {
     // REST API
     if (url.pathname.startsWith("/api/")) {
       const authResponse = checkAuth(request, env);
-      if (authResponse) {
-        return new Response(
-          JSON.stringify({ error: "Unauthorized" }),
-          {
-            status: 401,
-            headers: {
-              "Content-Type": "application/json",
-              ...cors(request),
-            },
-          }
+      if (authResponse) return authResponse;
+      // Unhandled throws become CF 500 HTML pages with no CORS headers,
+      // which browsers report as an opaque "failed to fetch".
+      try {
+        return await handleApi(request, env, url);
+      } catch (e: any) {
+        return jsonResp(
+          { error: e?.message || "Internal error" },
+          request,
+          500
         );
       }
-      return handleApi(request, env, url);
     }
 
     // MCP endpoint
@@ -1817,7 +1669,7 @@ export default {
       if (authResponse) return authResponse;
 
       const server = createServer(env);
-      const handler = createMcpHandler(server);
+      const handler = createMcpHandler(server as any);
       return handler(request, env, ctx);
     }
 

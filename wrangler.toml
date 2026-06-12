@@ -10,12 +10,6 @@ compatibility_flags = ["nodejs_compat"]
 
 # ─── Configuration ──────────────────────────────────────────────────
 [vars]
-# Behavior mode: "proactive" (default), "balanced", or "manual"
-# proactive = always recall at session start, store new info automatically
-# balanced  = recall when relevant, store key facts
-# manual    = only store/recall when explicitly asked
-MEMORY_BEHAVIOR = "proactive"
-
 # Categories (comma-separated). Defaults if not set:
 # people, preference, fact, project, health, date, technical, reflection, general
 # MEMORY_CATEGORIES = "people,preference,fact,project,health,date,technical,reflection,general"

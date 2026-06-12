@@ -33,6 +33,8 @@ Your AI gets 8 tools:
 
 When you store a memory, the server checks for semantically similar existing memories (cosine similarity > 0.85). If a near-duplicate exists, it tells you — with the option to update the existing memory instead. No more storing "user likes dark mode" twenty times.
 
+Storing with `force=true` **pins** the memory: it marks "I know this looks similar, keep it separate", and nightly consolidation will never merge it away.
+
 ### Importance Levels
 
 Not all memories are equal. Rate memories 1-5:
@@ -44,16 +46,6 @@ Not all memories are equal. Rate memories 1-5:
 - **1** — Trivial (throwaway context, might be useful someday)
 
 Recall results are weighted by importance — critical memories surface first.
-
-### Behavior Modes
-
-Control how proactively Claude uses memory via the `MEMORY_BEHAVIOR` setting:
-
-| Mode | Description |
-|------|-------------|
-| `proactive` | Recall at session start, store new info automatically. **(default)** |
-| `balanced` | Recall when relevant, store key facts. |
-| `manual` | Only store/recall when explicitly asked. |
 
 ### Configurable Categories
 
@@ -81,9 +73,10 @@ Every time a memory is recalled, its `last_accessed_at` timestamp and `access_co
 
 Enable a cron job that runs nightly to:
 
-1. **Find duplicate clusters** — memories with >85% semantic similarity
+1. **Find duplicate clusters** — memories with >85% semantic similarity, within the same category only
 2. **Merge them** — uses Workers AI (Llama 3.1 8B) to intelligently combine related memories into one richer entry
-3. **Track lineage** — merged memories store which originals they came from
+3. **Archive the originals** — source memories are moved to `memories_archive` (not deleted), so nothing is ever lost if the merge drops a detail
+4. **Track lineage** — merged memories store which originals they came from; pinned memories (`force=true`) are never touched
 
 Enable by uncommenting the `[triggers]` block in `wrangler.toml`:
 
@@ -134,10 +127,20 @@ npx wrangler d1 execute memory-db --remote --file=schema.sql
 npx wrangler secret put MEMORY_SECRET
 ```
 
+The secret is **required** — the server refuses all API/MCP requests (503) until it's set. It never runs open.
+
 ### 5. Deploy
 
 ```bash
 npm run deploy
+```
+
+### Upgrading from v2.1.x or earlier
+
+Databases created before v2.2.0 need a one-time migration (adds the `pinned` column and the consolidation archive table):
+
+```bash
+npx wrangler d1 execute memory-db --remote --file=migrations/2026-06-12-pinned-and-archive.sql
 ```
 
 ### Local development
@@ -191,12 +194,13 @@ Store: content → D1 (full record) + AI embed → Vectorize (vector)
          ↘ dedup check: Vectorize query (>0.85 = similar exists)
 
 Recall: query → AI embed → Vectorize (top-K, importance-weighted)
+                         → drop matches below 0.55 similarity
                          → D1 (full records) + update access tracking
-                         ↘ fallback: D1 keyword LIKE search
+                         ↘ no good matches: D1 keyword LIKE search
 
 Consolidation (nightly, opt-in):
-  for each memory → Vectorize queryById (find clusters)
-  → Workers AI merges cluster → replace with consolidated memory
+  for each unpinned memory → Vectorize queryById (same-category clusters)
+  → Workers AI merges cluster → archive originals → insert consolidated memory
 ```
 
 The embedding model (`@cf/baai/bge-base-en-v1.5`) runs on Cloudflare's edge via Workers AI — no external API calls, no extra billing.
