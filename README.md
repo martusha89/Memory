@@ -1,4 +1,12 @@
-# Memory
+<div align="center">
+
+<img src="https://capsule-render.vercel.app/api?type=waving&color=0:8B5CF6,100:22D3EE&height=170&section=header&text=Memory&fontColor=ffffff&fontSize=50&fontAlignY=40&desc=Persistent%20semantic%20memory%20for%20AI,%20on%20Cloudflare&descSize=17&descAlignY=64" width="100%" />
+
+[![Cloudflare Workers](https://img.shields.io/badge/Cloudflare%20Workers-F38020?style=for-the-badge&logo=cloudflare&logoColor=white)](#)
+[![MCP](https://img.shields.io/badge/MCP-server-8B5CF6?style=for-the-badge)](https://modelcontextprotocol.io)
+[![license](https://img.shields.io/badge/license-Non--Commercial-A855F7?style=for-the-badge)](LICENSE)
+
+</div>
 
 Persistent memory for AI assistants, deployed on Cloudflare. Your AI remembers things across conversations, across platforms, everywhere.
 
