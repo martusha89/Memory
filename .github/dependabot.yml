@@ -1,0 +1,17 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cloudflare-and-mcp:
+        patterns:
+          - "@cloudflare/*"
+          - "@modelcontextprotocol/*"
+          - "agents"
+          - "wrangler"
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

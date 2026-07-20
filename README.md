@@ -14,15 +14,23 @@ Built on **Cloudflare Workers** + **D1** (SQLite) + **Vectorize** (semantic sear
 
 ## Quick Start
 
+> **Important:** `create-memory-server@1.1.0` bundles the older v2.1 template.
+> Do not use that release: if secret provisioning fails, its generated Worker
+> can deploy without authentication. Until a v2.3-compatible CLI is published,
+> use the manual setup below.
+
 ```bash
-npx create-memory-server
+git clone https://github.com/martusha89/Memory.git
+cd Memory
+npm install
 ```
 
-That's it. The CLI walks you through everything — creates your Cloudflare resources, deploys the server, and configures Claude. Done in 2 minutes.
+Then follow [Manual Setup](#manual-setup). The current server fails closed when
+`MEMORY_SECRET` is absent.
 
 ## What It Does
 
-Your AI gets 8 tools:
+Your AI gets 11 tools:
 
 | Tool | Description |
 |------|-------------|
@@ -34,6 +42,9 @@ Your AI gets 8 tools:
 | `forget` | Delete a memory by ID (permanent). |
 | `review_stale` | Find memories not accessed in N days — helps clean up outdated info. |
 | `memory_stats` | Stats: totals, categories, importance distribution, stale count, most accessed. |
+| `repair_index` | Retry failed semantic indexing and clean up stale vectors. |
+| `list_archived` | Inspect original memories preserved by consolidation. |
+| `restore_archived` | Restore an archived memory and rebuild its vector. |
 
 ## Features
 
@@ -53,7 +64,16 @@ Not all memories are equal. Rate memories 1-5:
 - **2** — Minor (casual mentions, low-priority context)
 - **1** — Trivial (throwaway context, might be useful someday)
 
-Recall results are weighted by importance — critical memories surface first.
+Recall combines Vectorize semantic matches with D1 FTS5 lexical matches, then
+reranks by relevance and importance. The D1 path also provides immediate
+read-after-write recall while Vectorize applies updates asynchronously.
+
+### Self-Healing Vector Index
+
+D1 is authoritative. Every memory records whether its Vectorize entry is
+`pending`, `ready`, or `error`. Failed upserts and deletes are retried by the
+nightly maintenance handler or manually with `repair_index`, so a temporary
+Vectorize failure cannot silently make a memory disappear forever.
 
 ### Configurable Categories
 
@@ -85,6 +105,7 @@ Enable a cron job that runs nightly to:
 2. **Merge them** — uses Workers AI (Llama 3.1 8B) to intelligently combine related memories into one richer entry
 3. **Archive the originals** — source memories are moved to `memories_archive` (not deleted), so nothing is ever lost if the merge drops a detail
 4. **Track lineage** — merged memories store which originals they came from; pinned memories (`force=true`) are never touched
+5. **Remain recoverable** — originals are visible in the web archive and can be restored
 
 Enable by uncommenting the `[triggers]` block in `wrangler.toml`:
 
@@ -93,7 +114,11 @@ Enable by uncommenting the `[triggers]` block in `wrangler.toml`:
 crons = ["0 2 * * *"]  # 2:00 AM UTC
 ```
 
-**Free tier note:** The consolidation uses Workers AI (10,000 neurons/day free) and is subject to the 50-subrequest limit on the free Workers plan. It processes up to 20 clusters per run and catches up over multiple nights if needed.
+**Free tier note:** Consolidation processes at most 1 cluster from a bounded
+10-memory seed set per run. Archive/delete work is sent to D1 as transactional
+batches, Vectorize deletes are batched, and scheduled vector repair is limited
+to 3 candidates so the combined maintenance invocation stays within D1's free
+per-invocation query budget.
 
 ## Manual Setup
 
@@ -102,7 +127,7 @@ If you prefer to set things up manually instead of using the CLI:
 ### Prerequisites
 
 - A [Cloudflare account](https://dash.cloudflare.com/sign-up) (free tier works)
-- [Node.js](https://nodejs.org/) 18+
+- [Node.js](https://nodejs.org/) 20+
 - [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/install-and-update/) (`npm install -g wrangler`)
 
 ### 1. Clone and install
@@ -145,11 +170,28 @@ npm run deploy
 
 ### Upgrading from v2.1.x or earlier
 
-Databases created before v2.2.0 need a one-time migration (adds the `pinned` column and the consolidation archive table):
+Run both migrations in order before deploying v2.3. The first creates the v2.2
+`pinned` and archive schema; the second adds all v2.3 hardening state:
 
 ```bash
 npx wrangler d1 execute memory-db --remote --file=migrations/2026-06-12-pinned-and-archive.sql
+npm run db:migrate:hardening
 ```
+
+### Upgrading from v2.2.x
+
+Apply the v2.3 reliability migration before deploying the new Worker:
+
+```bash
+npm run db:migrate:hardening
+```
+
+The migration adds FTS5 search, vector repair state, recoverable consolidation
+metadata, and maintenance locks. Existing records remain available to lexical
+recall immediately, but semantic scoring is deliberately withheld while their
+new tracking state is `pending`. After deployment, call `repair_index` in bounded
+batches until it reports `inspected: 0` before relying on semantic recall again.
+Take a D1 backup before any production schema migration.
 
 ### Local development
 
@@ -169,7 +211,14 @@ Add to `claude_desktop_config.json`:
   "mcpServers": {
     "memory": {
       "command": "npx",
-      "args": ["-y", "mcp-remote", "https://YOUR-SERVER.workers.dev/mcp?secret=YOUR_SECRET"]
+          "args": [
+            "-y", "mcp-remote",
+            "https://YOUR-SERVER.workers.dev/mcp",
+            "--header", "Authorization: Bearer ${MEMORY_SECRET}"
+          ],
+          "env": {
+            "MEMORY_SECRET": "YOUR_SECRET"
+          }
     }
   }
 }
@@ -178,22 +227,30 @@ Add to `claude_desktop_config.json`:
 ### Claude Code
 
 ```bash
-claude mcp add memory --transport sse "https://YOUR-SERVER.workers.dev/sse?secret=YOUR_SECRET"
+claude mcp add memory --transport http \
+  --header "Authorization: Bearer YOUR_SECRET" \
+  "https://YOUR-SERVER.workers.dev/mcp"
 ```
 
 ### Claude Mobile / Web
 
 Add as a remote MCP server in Claude settings:
-- **URL:** `https://YOUR-SERVER.workers.dev/mcp?secret=YOUR_SECRET`
+- **URL:** `https://YOUR-SERVER.workers.dev/mcp`
 - **Transport:** Streamable HTTP
+- **Authorization:** `Bearer YOUR_SECRET`
 
 ### Any MCP Client
 
-The server exposes two MCP-compatible endpoints:
-- `/mcp` — Streamable HTTP transport
-- `/sse` — SSE transport
+The server exposes `/mcp` using the Streamable HTTP transport.
 
-Auth via `Authorization: Bearer YOUR_SECRET` header or `?secret=YOUR_SECRET` query parameter.
+Authenticate with `Authorization: Bearer YOUR_SECRET`. Query-string secrets are
+disabled by default because URLs are commonly retained in history and logs. If
+a legacy MCP client cannot send headers, set `ALLOW_QUERY_AUTH = "true"` in
+`wrangler.toml` and use `?secret=...` only as a compatibility fallback.
+
+Cross-origin browser access is denied by default. Set
+`MEMORY_ALLOWED_ORIGINS` to a comma-separated list of exact trusted origins if
+you host the UI separately.
 
 ## How It Works
 
@@ -201,24 +258,27 @@ Auth via `Authorization: Bearer YOUR_SECRET` header or `?secret=YOUR_SECRET` que
 Store: content → D1 (full record) + AI embed → Vectorize (vector)
          ↘ dedup check: Vectorize query (>0.85 = similar exists)
 
-Recall: query → AI embed → Vectorize (top-K, importance-weighted)
-                         → drop matches below 0.55 similarity
-                         → D1 (full records) + update access tracking
-                         ↘ no good matches: D1 keyword LIKE search
+Recall: query → AI embed → Vectorize candidates ┐
+              → D1 FTS5 lexical candidates ─────┼→ hybrid rerank → top-K
+                                                └→ update access tracking
 
 Consolidation (nightly, opt-in):
   for each unpinned memory → Vectorize queryById (same-category clusters)
-  → Workers AI merges cluster → archive originals → insert consolidated memory
+  → Workers AI merges cluster → index replacement → transactional D1 archive/delete
+  → batched vector cleanup; failures recorded for retry
 ```
 
-The embedding model (`@cf/baai/bge-base-en-v1.5`) runs on Cloudflare's edge via Workers AI — no external API calls, no extra billing.
+The embedding model (`@cf/baai/bge-base-en-v1.5`) runs on Cloudflare's edge via
+Workers AI, so no external model API key is needed. Its usage counts against
+your Workers AI allocation and can be billable above the included allowance on
+a paid Workers plan.
 
 ## Cost
 
 On the **Cloudflare free tier** you get:
 
 - **D1**: 5M rows read, 100K rows written per day
-- **Vectorize**: 30M queried vector dimensions, 10M stored vector dimensions per month
+- **Vectorize**: 30M queried vector dimensions per month, 5M stored vector dimensions
 - **Workers AI**: 10,000 neurons per day
 - **Workers**: 100K requests per day
 
