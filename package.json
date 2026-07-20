@@ -1,26 +1,47 @@
 {
   "name": "@aidhd/memory-server",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "Persistent AI memory on Cloudflare — semantic search via MCP",
   "main": "src/index.ts",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:migration": "node scripts/test-migration.mjs",
+    "build": "wrangler deploy --dry-run",
+    "check": "npm run typecheck && npm test && npm run test:migration && npm run build",
+    "audit": "npm audit --audit-level=high",
     "db:create": "wrangler d1 create memory-db",
     "db:schema": "wrangler d1 execute memory-db --remote --file=schema.sql",
-    "db:schema:local": "wrangler d1 execute memory-db --local --file=schema.sql"
+    "db:schema:local": "wrangler d1 execute memory-db --local --file=schema.sql",
+    "db:migrate:hardening": "wrangler d1 execute memory-db --remote --file=migrations/2026-07-20-hardening.sql",
+    "db:migrate:hardening:local": "wrangler d1 execute memory-db --local --file=migrations/2026-07-20-hardening.sql"
   },
-  "keywords": ["mcp", "memory", "ai", "cloudflare", "semantic-search", "vectorize"],
+  "keywords": [
+    "mcp",
+    "memory",
+    "ai",
+    "cloudflare",
+    "semantic-search",
+    "vectorize"
+  ],
   "license": "SEE LICENSE IN LICENSE",
-  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "type": "module",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.27.1",
-    "agents": "^0.6.0",
-    "wrangler": "^4.68.1",
-    "zod": "^4.3.6"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "agents": "^0.17.4",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260304.0",
-    "typescript": "^5.9.3"
+    "@cloudflare/vitest-pool-workers": "^0.18.6",
+    "@cloudflare/workers-types": "^4.20260702.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10",
+    "wrangler": "^4.105.0"
   }
 }

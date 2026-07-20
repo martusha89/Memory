@@ -5,7 +5,7 @@
 
 name = "memory-server"
 main = "src/index.ts"
-compatibility_date = "2025-01-01"
+compatibility_date = "2026-07-02"
 compatibility_flags = ["nodejs_compat"]
 
 # ─── Configuration ──────────────────────────────────────────────────
@@ -13,6 +13,15 @@ compatibility_flags = ["nodejs_compat"]
 # Categories (comma-separated). Defaults if not set:
 # people, preference, fact, project, health, date, technical, reflection, general
 # MEMORY_CATEGORIES = "people,preference,fact,project,health,date,technical,reflection,general"
+
+# Cross-origin browser clients are denied by default. Add exact origins only
+# when hosting the web UI separately from this Worker.
+# MEMORY_ALLOWED_ORIGINS = "https://memory-ui.example.com"
+
+# Query-string secrets leak into URLs and logs, so they are disabled by
+# default. Prefer Authorization: Bearer. Enable only for an MCP client that
+# cannot send headers.
+ALLOW_QUERY_AUTH = "false"
 
 # ─── Cloudflare AI (for embeddings + consolidation) ────────────────
 [ai]
@@ -34,7 +43,7 @@ database_id = "YOUR_DATABASE_ID"     # Replace after running: npx wrangler d1 cr
 # The cron job runs nightly and merges similar/duplicate memories using AI.
 # NOTE: This uses Workers AI (free tier: 10,000 neurons/day) and is
 # subject to the 50-subrequest limit on the free Workers plan.
-# Processes up to 20 clusters per run — catches up over multiple nights.
+# Processes up to 5 clusters from a bounded seed set per run.
 #
 # [triggers]
 # crons = ["0 2 * * *"]  # 2:00 AM UTC — adjust to your timezone
