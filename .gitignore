@@ -1,6 +1,9 @@
 node_modules/
 dist/
+__pycache__/
+*.pyc
 .wrangler/
+.wrangler-ui-test/
 .dev.vars
 .wrangler-dev.*.log
 .env

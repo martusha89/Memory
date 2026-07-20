@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import {
   MAX_CONTENT_LENGTH,
+  MAX_TAGS,
   MAX_TAG_LENGTH,
   SOURCES,
   contentSchema,
@@ -13,6 +14,7 @@ import {
   hashContent,
   importanceSchema,
   importanceValueSchema,
+  likePattern,
   recallSchema,
   safeNumberArray,
   safeStringArray,
@@ -44,9 +46,13 @@ interface Memory {
   vector_status: "pending" | "ready" | "error";
   vector_error: string | null;
   vector_updated_at: string | null;
+  vector_generation: number;
   access_count: number;
   last_accessed_at: string | null;
   consolidated_from: string | null;
+  restored_from_archive_id: number | null;
+  maintenance_owner: string | null;
+  maintenance_expires_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -81,8 +87,10 @@ const SIMILARITY_THRESHOLD = 0.85;
 // fallback is unreachable.
 const MIN_RECALL_SCORE = 0.55;
 const STALE_DAYS = 90;
-const MAX_CONSOLIDATION_BATCHES = 5;
-const MAX_REPAIR_BATCH = 25;
+const MAX_CONSOLIDATION_BATCHES = 1;
+const MAX_CONSOLIDATION_SEEDS = 10;
+const SCHEDULED_REPAIR_BATCH = 3;
+const MAX_REPAIR_BATCH = 20;
 
 // ── Helpers ───────────────────────────────────────────────────────────
 async function embed(ai: Ai, text: string): Promise<number[]> {
@@ -94,13 +102,17 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message.slice(0, 500) : "Unknown error";
 }
 
+function safeImportance(value: number | null | undefined): number {
+  return Number.isInteger(value) ? Math.min(5, Math.max(1, value!)) : 3;
+}
+
 function formatMemory(m: Memory) {
   return {
     id: m.id,
     content: m.content,
     category: m.category,
     tags: safeStringArray(m.tags),
-    importance: m.importance,
+    importance: safeImportance(m.importance),
     source: m.source,
     pinned: !!m.pinned,
     vector_status: m.vector_status,
@@ -123,7 +135,7 @@ function formatArchivedMemory(m: ArchivedMemory) {
     content: m.content,
     category: m.category || "general",
     tags: safeStringArray(m.tags),
-    importance: m.importance || 3,
+    importance: safeImportance(m.importance),
     source: m.source || "unknown",
     pinned: !!m.pinned,
     access_count: m.access_count || 0,
@@ -186,9 +198,43 @@ async function touchAccess(db: D1Database, ids: number[]): Promise<void> {
 // ── Shared Recall (used by REST + MCP) ───────────────────────────────
 async function indexMemory(
   env: Env,
-  memory: Pick<Memory, "id" | "content" | "category" | "source" | "importance">,
-  existingVector?: number[]
+  memory: Pick<
+    Memory,
+    | "id"
+    | "content"
+    | "category"
+    | "source"
+    | "importance"
+    | "vector_generation"
+  >,
+  existingVector?: number[],
+  existingOwner?: string
 ): Promise<{ ready: boolean; error?: string }> {
+  const owner = existingOwner || `index:${crypto.randomUUID()}`;
+  const claimed = existingOwner
+    ? await env.DB.prepare(
+        `SELECT id FROM memories
+         WHERE id = ? AND vector_generation = ? AND maintenance_owner = ?`
+      )
+        .bind(memory.id, memory.vector_generation, owner)
+        .first<{ id: number }>()
+    : await env.DB.prepare(
+        `UPDATE memories
+         SET maintenance_owner = ?, maintenance_expires_at = datetime('now', '+15 minutes')
+         WHERE id = ? AND vector_generation = ?
+           AND (maintenance_owner IS NULL OR maintenance_expires_at < datetime('now'))
+         RETURNING id`
+      )
+        .bind(owner, memory.id, memory.vector_generation)
+        .first<{ id: number }>();
+
+  if (!claimed) {
+    return {
+      ready: false,
+      error: "Indexing deferred because the memory changed or is busy",
+    };
+  }
+
   try {
     const vector = existingVector || (await embed(env.AI, memory.content));
     await env.VECTORIZE.upsert([
@@ -203,27 +249,56 @@ async function indexMemory(
         },
       },
     ]);
-    await env.DB.prepare(
+    const readyResult = await env.DB.prepare(
       `UPDATE memories
        SET vector_status = 'ready', vector_error = NULL,
            vector_updated_at = datetime('now')
-       WHERE id = ?`
+       WHERE id = ? AND vector_generation = ? AND maintenance_owner = ?`
     )
-      .bind(memory.id)
+      .bind(memory.id, memory.vector_generation, owner)
       .run();
+    if ((readyResult.meta.changes || 0) !== 1) {
+      throw new Error("Index generation was superseded before commit");
+    }
     return { ready: true };
   } catch (error) {
     const message = errorMessage(error);
-    await env.DB.prepare(
-      `UPDATE memories
-       SET vector_status = 'error', vector_error = ?,
-           vector_updated_at = datetime('now')
-       WHERE id = ?`
-    )
-      .bind(message, memory.id)
-      .run();
+    try {
+      await env.DB.prepare(
+        `UPDATE memories
+         SET vector_status = 'error', vector_error = ?,
+             vector_updated_at = datetime('now')
+         WHERE id = ? AND vector_generation = ? AND maintenance_owner = ?`
+      )
+        .bind(message, memory.id, memory.vector_generation, owner)
+        .run();
+    } catch (statusError) {
+      // The row was inserted as pending before indexing. If this status write
+      // also fails, leaving it pending ensures repair_index will still retry it.
+      console.error("memory_index_status_failed", {
+        id: memory.id,
+        error: errorMessage(statusError),
+      });
+    }
     console.error("memory_index_failed", { id: memory.id, error: message });
     return { ready: false, error: message };
+  } finally {
+    if (!existingOwner) {
+      try {
+        await env.DB.prepare(
+          `UPDATE memories
+           SET maintenance_owner = NULL, maintenance_expires_at = NULL
+           WHERE id = ? AND maintenance_owner = ?`
+        )
+          .bind(memory.id, owner)
+          .run();
+      } catch (releaseError) {
+        console.error("memory_index_lock_release_failed", {
+          id: memory.id,
+          error: errorMessage(releaseError),
+        });
+      }
+    }
   }
 }
 
@@ -255,9 +330,10 @@ async function lexicalMemories(
     }
   }
 
+  const pattern = likePattern(query);
+  if (!pattern) return [];
   let sql = "SELECT * FROM memories WHERE content LIKE ? ESCAPE '\\'";
-  const escaped = query.replace(/[\\%_]/g, "\\$&");
-  const binds: unknown[] = [`%${escaped}%`];
+  const binds: unknown[] = [pattern];
   if (category) {
     sql += " AND category = ?";
     binds.push(category);
@@ -297,10 +373,15 @@ async function recallMemories(
   let vectorMemories: Memory[] = [];
   if (vectorIds.length > 0) {
     const placeholders = vectorIds.map(() => "?").join(",");
-    const { results } = await env.DB.prepare(
-      `SELECT * FROM memories WHERE id IN (${placeholders})`
-    )
-      .bind(...vectorIds)
+    let sql = `SELECT * FROM memories
+               WHERE id IN (${placeholders}) AND vector_status = 'ready'`;
+    const binds: unknown[] = [...vectorIds];
+    if (category) {
+      sql += " AND category = ?";
+      binds.push(category);
+    }
+    const { results } = await env.DB.prepare(sql)
+      .bind(...binds)
       .all();
     vectorMemories = results as unknown as Memory[];
   }
@@ -352,7 +433,7 @@ async function findDuplicate(
   env: Env,
   content: string,
   category: string,
-  vector: number[]
+  vector?: number[]
 ): Promise<{ memory: Memory; similarity: number } | null> {
   const contentHash = await hashContent(content);
   const exact = await env.DB.prepare(
@@ -363,12 +444,19 @@ async function findDuplicate(
     .bind(category, contentHash, content)
     .first<Memory>();
   if (exact) return { memory: exact, similarity: 1 };
+  if (!vector) return null;
 
-  const similar = await env.VECTORIZE.query(vector, {
-    topK: 5,
-    returnMetadata: "all",
-    filter: { category },
-  });
+  let similar: VectorizeMatches;
+  try {
+    similar = await env.VECTORIZE.query(vector, {
+      topK: 5,
+      returnMetadata: "all",
+      filter: { category },
+    });
+  } catch (error) {
+    console.warn("semantic_dedup_failed", { error: errorMessage(error) });
+    return null;
+  }
   const dupes = (similar.matches || []).filter(
     (m) => m.score >= SIMILARITY_THRESHOLD
   );
@@ -376,9 +464,10 @@ async function findDuplicate(
   const ids = dupes.map((d) => d.id);
   const ph = ids.map(() => "?").join(",");
   const { results } = await env.DB.prepare(
-    `SELECT * FROM memories WHERE id IN (${ph})`
+    `SELECT * FROM memories
+     WHERE id IN (${ph}) AND vector_status = 'ready' AND category = ?`
   )
-    .bind(...ids)
+    .bind(...ids, category)
     .all();
   const byId = new Map(
     (results as unknown as Memory[]).map((memory) => [memory.id.toString(), memory])
@@ -389,15 +478,52 @@ async function findDuplicate(
   return { memory: existing, similarity: best!.score };
 }
 
-async function deleteMemory(env: Env, id: number): Promise<void> {
-  await env.DB.batch([
+async function deleteMemory(
+  env: Env,
+  id: number,
+  existingOwner?: string
+): Promise<boolean> {
+  const deletionOwner = existingOwner || `delete:${crypto.randomUUID()}`;
+  const claimed = existingOwner
+    ? await env.DB.prepare(
+        "SELECT id FROM memories WHERE id = ? AND maintenance_owner = ?"
+      )
+        .bind(id, deletionOwner)
+        .first<{ id: number }>()
+    : await env.DB.prepare(
+        `UPDATE memories
+         SET maintenance_owner = ?, maintenance_expires_at = datetime('now', '+5 minutes')
+         WHERE id = ?
+           AND (maintenance_owner IS NULL OR maintenance_expires_at < datetime('now'))
+         RETURNING id`
+      )
+        .bind(deletionOwner, id)
+        .first<{ id: number }>();
+  if (!claimed) return false;
+
+  const batch = await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO vector_tombstones (memory_id)
        VALUES (?)
        ON CONFLICT(memory_id) DO UPDATE SET updated_at = datetime('now')`
     ).bind(id.toString()),
-    env.DB.prepare("DELETE FROM memories WHERE id = ?").bind(id),
+    env.DB.prepare(
+      "DELETE FROM memories WHERE id = ? AND maintenance_owner = ?"
+    ).bind(id, deletionOwner),
   ]);
+  if ((batch[1].meta.changes || 0) !== 1) {
+    await env.DB.prepare(
+      `UPDATE memories
+       SET maintenance_owner = NULL, maintenance_expires_at = NULL
+       WHERE id = ? AND maintenance_owner = ?`
+    )
+      .bind(id, deletionOwner)
+      .run();
+    await env.DB.prepare("DELETE FROM vector_tombstones WHERE memory_id = ?")
+      .bind(id.toString())
+      .run();
+    return false;
+  }
   try {
     await env.VECTORIZE.deleteByIds([id.toString()]);
     await env.DB.prepare("DELETE FROM vector_tombstones WHERE memory_id = ?")
@@ -405,15 +531,23 @@ async function deleteMemory(env: Env, id: number): Promise<void> {
       .run();
   } catch (error) {
     const message = errorMessage(error);
-    await env.DB.prepare(
-      `UPDATE vector_tombstones
-       SET attempts = attempts + 1, last_error = ?, updated_at = datetime('now')
-       WHERE memory_id = ?`
-    )
-      .bind(message, id.toString())
-      .run();
+    try {
+      await env.DB.prepare(
+        `UPDATE vector_tombstones
+         SET attempts = attempts + 1, last_error = ?, updated_at = datetime('now')
+         WHERE memory_id = ?`
+      )
+        .bind(message, id.toString())
+        .run();
+    } catch (statusError) {
+      console.error("vector_delete_status_failed", {
+        id,
+        error: errorMessage(statusError),
+      });
+    }
     console.error("vector_delete_failed", { id, error: message });
   }
+  return true;
 }
 
 async function deleteVectorsWithRetry(env: Env, ids: string[]): Promise<void> {
@@ -428,31 +562,42 @@ async function deleteVectorsWithRetry(env: Env, ids: string[]): Promise<void> {
       .run();
   } catch (error) {
     const message = errorMessage(error);
-    await env.DB.batch(
-      ids.map((id) =>
-        env.DB.prepare(
-          `INSERT INTO vector_tombstones
-             (memory_id, attempts, last_error, updated_at)
-           VALUES (?, 1, ?, datetime('now'))
-           ON CONFLICT(memory_id) DO UPDATE SET
-             attempts = attempts + 1,
-             last_error = excluded.last_error,
-             updated_at = datetime('now')`
-        ).bind(id, message)
-      )
-    );
+    try {
+      await env.DB.batch(
+        ids.map((id) =>
+          env.DB.prepare(
+            `INSERT INTO vector_tombstones
+               (memory_id, attempts, last_error, updated_at)
+             VALUES (?, 1, ?, datetime('now'))
+             ON CONFLICT(memory_id) DO UPDATE SET
+               attempts = attempts + 1,
+               last_error = excluded.last_error,
+               updated_at = datetime('now')`
+          ).bind(id, message)
+        )
+      );
+    } catch (queueError) {
+      // Callers queue tombstones before removing authoritative D1 rows. A
+      // failed metadata update must never turn cleanup into a data-loss path.
+      console.error("vector_delete_queue_update_failed", {
+        ids,
+        error: errorMessage(queueError),
+      });
+    }
     console.error("vector_batch_delete_failed", { ids, error: message });
   }
 }
 
 async function repairVectorIndex(env: Env, limit = MAX_REPAIR_BATCH) {
   const safeLimit = Math.min(Math.max(Math.trunc(limit), 1), MAX_REPAIR_BATCH);
+  const vectorLimit = Math.max(1, Math.ceil(safeLimit / 2));
+  const tombstoneLimit = Math.max(1, safeLimit - vectorLimit);
   const { results } = await env.DB.prepare(
     `SELECT * FROM memories
      WHERE vector_status != 'ready'
-     ORDER BY updated_at ASC LIMIT ?`
+     ORDER BY COALESCE(vector_updated_at, updated_at) ASC LIMIT ?`
   )
-    .bind(safeLimit)
+    .bind(vectorLimit)
     .all();
 
   let repaired = 0;
@@ -464,25 +609,39 @@ async function repairVectorIndex(env: Env, limit = MAX_REPAIR_BATCH) {
   }
 
   const { results: tombstones } = await env.DB.prepare(
-    "SELECT memory_id FROM vector_tombstones ORDER BY created_at ASC LIMIT ?"
+    "SELECT memory_id FROM vector_tombstones ORDER BY updated_at ASC LIMIT ?"
   )
-    .bind(safeLimit)
+    .bind(tombstoneLimit)
     .all<{ memory_id: string }>();
   let deletedVectors = 0;
-  if (tombstones.length > 0) {
-    const ids = tombstones.map((row) => row.memory_id);
+  let failedVectorDeletes = 0;
+  for (const tombstone of tombstones) {
     try {
-      await env.VECTORIZE.deleteByIds(ids);
-      const placeholders = ids.map(() => "?").join(",");
+      await env.VECTORIZE.deleteByIds([tombstone.memory_id]);
       await env.DB.prepare(
-        `DELETE FROM vector_tombstones WHERE memory_id IN (${placeholders})`
+        "DELETE FROM vector_tombstones WHERE memory_id = ?"
       )
-        .bind(...ids)
+        .bind(tombstone.memory_id)
         .run();
-      deletedVectors = ids.length;
+      deletedVectors++;
     } catch (error) {
+      failedVectorDeletes++;
+      try {
+        await env.DB.prepare(
+          `UPDATE vector_tombstones
+           SET attempts = attempts + 1, last_error = ?, updated_at = datetime('now')
+           WHERE memory_id = ?`
+        )
+          .bind(errorMessage(error), tombstone.memory_id)
+          .run();
+      } catch (statusError) {
+        console.error("vector_tombstone_status_failed", {
+          id: tombstone.memory_id,
+          error: errorMessage(statusError),
+        });
+      }
       console.error("vector_tombstone_repair_failed", {
-        ids,
+        id: tombstone.memory_id,
         error: errorMessage(error),
       });
     }
@@ -492,7 +651,9 @@ async function repairVectorIndex(env: Env, limit = MAX_REPAIR_BATCH) {
     inspected: results.length,
     repaired,
     failed,
+    tombstones_inspected: tombstones.length,
     deleted_vectors: deletedVectors,
+    failed_vector_deletes: failedVectorDeletes,
   };
 }
 
@@ -586,47 +747,85 @@ async function restoreArchivedMemory(
     .first<ArchivedMemory>();
   if (!archived) return null;
 
-  if (archived.restored_memory_id) {
-    const existingRestore = await env.DB.prepare(
-      "SELECT * FROM memories WHERE id = ?"
-    )
-      .bind(archived.restored_memory_id)
-      .first<Memory>();
-    if (existingRestore) return existingRestore;
+  const existingRestore = await env.DB.prepare(
+    `SELECT * FROM memories
+     WHERE restored_from_archive_id = ? OR id = ?
+     ORDER BY restored_from_archive_id DESC LIMIT 1`
+  )
+    .bind(archiveId, archived.restored_memory_id || -1)
+    .first<Memory>();
+  if (existingRestore) {
+    try {
+      await env.DB.prepare(
+        `UPDATE memories_archive
+         SET restored_memory_id = ?, restored_at = COALESCE(restored_at, datetime('now'))
+         WHERE id = ?`
+      )
+        .bind(existingRestore.id, archiveId)
+        .run();
+    } catch (error) {
+      console.error("archive_restore_marker_failed", {
+        archive_id: archiveId,
+        error: errorMessage(error),
+      });
+    }
+    return existingRestore;
   }
 
   const contentHash = await hashContent(archived.content);
-  const restored = await env.DB.prepare(
-    `INSERT INTO memories
-      (content, category, tags, importance, source, pinned, content_hash,
-       vector_status, access_count, last_accessed_at, consolidated_from,
-       created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'restore', ?, ?, 'pending', ?, ?, ?,
-             COALESCE(?, datetime('now')), datetime('now'))
-     RETURNING *`
-  )
-    .bind(
-      archived.content,
-      archived.category || "general",
-      archived.tags || "[]",
-      archived.importance || 3,
-      archived.pinned || 0,
-      contentHash,
-      archived.access_count || 0,
-      archived.last_accessed_at,
-      archived.consolidated_from,
-      archived.created_at
+  let restored: Memory | null;
+  let needsIndex = true;
+  try {
+    restored = await env.DB.prepare(
+      `INSERT INTO memories
+        (content, category, tags, importance, source, pinned, content_hash,
+         vector_status, access_count, last_accessed_at, consolidated_from,
+         restored_from_archive_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'restore', ?, ?, 'pending', ?, ?, ?, ?,
+               COALESCE(?, datetime('now')), datetime('now'))
+       RETURNING *`
     )
-    .first<Memory>();
+      .bind(
+        archived.content,
+        archived.category || "general",
+        archived.tags || "[]",
+        safeImportance(archived.importance),
+        archived.pinned || 0,
+        contentHash,
+        archived.access_count || 0,
+        archived.last_accessed_at,
+        archived.consolidated_from,
+        archiveId,
+        archived.created_at
+      )
+      .first<Memory>();
+  } catch (error) {
+    // A concurrent restore wins the unique archive-id claim. Return that row
+    // instead of creating a second active copy.
+    restored = await env.DB.prepare(
+      "SELECT * FROM memories WHERE restored_from_archive_id = ?"
+    )
+      .bind(archiveId)
+      .first<Memory>();
+    if (!restored) throw error;
+    needsIndex = false;
+  }
   if (!restored) return null;
-  await indexMemory(env, restored);
-  await env.DB.prepare(
-    `UPDATE memories_archive
-     SET restored_memory_id = ?, restored_at = datetime('now')
-     WHERE id = ?`
-  )
-    .bind(restored.id, archiveId)
-    .run();
+  if (needsIndex) await indexMemory(env, restored);
+  try {
+    await env.DB.prepare(
+      `UPDATE memories_archive
+       SET restored_memory_id = ?, restored_at = COALESCE(restored_at, datetime('now'))
+       WHERE id = ?`
+    )
+      .bind(restored.id, archiveId)
+      .run();
+  } catch (error) {
+    console.error("archive_restore_marker_failed", {
+      archive_id: archiveId,
+      error: errorMessage(error),
+    });
+  }
   return (await env.DB.prepare("SELECT * FROM memories WHERE id = ?")
     .bind(restored.id)
     .first<Memory>()) || restored;
@@ -649,7 +848,9 @@ function cors(request: Request, env?: Env): Record<string, string> {
   return {
     ...(allowedOrigin ? { "Access-Control-Allow-Origin": allowedOrigin } : {}),
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Headers":
+      "Accept, Content-Type, Authorization, MCP-Protocol-Version, Mcp-Session-Id, Last-Event-ID",
+    "Access-Control-Expose-Headers": "Mcp-Session-Id",
     "Access-Control-Max-Age": "86400",
     Vary: "Origin",
   };
@@ -848,7 +1049,14 @@ async function handleApi(
       if (importance < 1 || importance > 5)
         return apiError("importance must be 1-5", request);
 
-      const vector = await embed(env.AI, content);
+      let vector: number[] | undefined;
+      if (!force) {
+        try {
+          vector = await embed(env.AI, content);
+        } catch (error) {
+          console.warn("dedup_embedding_failed", { error: errorMessage(error) });
+        }
+      }
       const contentHash = await hashContent(content);
 
       // Dedup check
@@ -892,37 +1100,7 @@ async function handleApi(
       if (!result)
         return apiError("Failed to store memory", request, 500);
 
-      let indexing: { ready: boolean; error?: string };
-      try {
-        await env.VECTORIZE.upsert([
-          {
-            id: result.id.toString(),
-            values: vector,
-            metadata: {
-              category,
-              source,
-              importance,
-              timestamp: Date.now(),
-            },
-          },
-        ]);
-        await env.DB.prepare(
-          `UPDATE memories SET vector_status = 'ready', vector_error = NULL,
-           vector_updated_at = datetime('now') WHERE id = ?`
-        )
-          .bind(result.id)
-          .run();
-        indexing = { ready: true };
-      } catch (error) {
-        const message = errorMessage(error);
-        await env.DB.prepare(
-          `UPDATE memories SET vector_status = 'error', vector_error = ?,
-           vector_updated_at = datetime('now') WHERE id = ?`
-        )
-          .bind(message, result.id)
-          .run();
-        indexing = { ready: false, error: message };
-      }
+      const indexing = await indexMemory(env, result, vector);
 
       const stored = await env.DB.prepare("SELECT * FROM memories WHERE id = ?")
         .bind(result.id)
@@ -968,13 +1146,19 @@ async function handleApi(
       const contentHash =
         content !== undefined ? await hashContent(newContent) : existing.content_hash;
 
-      await env.DB.prepare(
+      const updateResult = await env.DB.prepare(
         `UPDATE memories
          SET content = ?, category = ?, tags = ?, importance = ?, content_hash = ?,
              vector_status = CASE WHEN ? THEN 'pending' ELSE vector_status END,
              vector_error = CASE WHEN ? THEN NULL ELSE vector_error END,
+             vector_generation = vector_generation + CASE WHEN ? THEN 1 ELSE 0 END,
+             maintenance_owner = NULL, maintenance_expires_at = NULL,
              updated_at = datetime('now')
-         WHERE id = ?`
+         WHERE id = ?
+           AND content IS ? AND category IS ? AND tags IS ?
+           AND importance IS ? AND content_hash IS ? AND vector_generation = ?
+           AND (maintenance_owner IS NULL OR maintenance_expires_at < datetime('now'))
+         RETURNING *`
       )
         .bind(
           newContent,
@@ -984,21 +1168,25 @@ async function handleApi(
           contentHash,
           needsUpsert ? 1 : 0,
           needsUpsert ? 1 : 0,
-          id
+          needsUpsert ? 1 : 0,
+          id,
+          existing.content,
+          existing.category,
+          existing.tags,
+          existing.importance,
+          existing.content_hash,
+          existing.vector_generation
         )
-        .run();
+        .first<Memory>();
+      if (!updateResult) {
+        return apiError("Memory changed concurrently or is temporarily locked", request, 409);
+      }
 
       // Re-upsert when content OR vector metadata changed — Vectorize has
       // no metadata-only update, and stale category metadata silently
       // breaks category-filtered recall.
       if (needsUpsert) {
-        await indexMemory(env, {
-          id,
-          content: newContent,
-          category: newCategory,
-          source: existing.source,
-          importance: newImportance,
-        });
+        await indexMemory(env, updateResult);
       }
 
       const updated = await env.DB.prepare(
@@ -1019,7 +1207,9 @@ async function handleApi(
       if (!existing)
         return apiError("Memory not found", request, 404);
 
-      await deleteMemory(env, id);
+      if (!(await deleteMemory(env, id))) {
+        return apiError("Memory is temporarily locked for maintenance", request, 409);
+      }
 
       return jsonResp({ deleted: true, id }, request);
     }
@@ -1049,7 +1239,7 @@ async function handleApi(
 // ── Tool Descriptions ─────────────────────────────────────────────────
 const TOOL_DESC = {
   store: "Store a memory — facts, preferences, decisions, people, health details, project context. Duplicates are caught automatically (cosine similarity > 0.85).",
-  recall: "Search memories by meaning, weighted by importance. Use natural language queries like 'what does the user prefer for X'. Falls back to keyword search if no semantic matches.",
+  recall: "Search memories with hybrid semantic and lexical retrieval, weighted by relevance and importance. Use natural language queries like 'what does the user prefer for X'.",
   update: "Update an existing memory's content, category, tags, or importance. Use this when you learn new details about something already stored — don't create duplicates, update the existing memory instead. Re-embeds automatically.",
   review_stale: "List memories that haven't been accessed in a while. Use this to help the user clean up old, potentially outdated memories. Returns memories not recalled in the specified number of days.",
   stats: "Get statistics about the memory store — total count, breakdown by category and source, importance distribution, stale memory count, and storage health.",
@@ -1069,6 +1259,9 @@ function createServer(env: Env) {
     content: contentSchema.describe("The memory content to store"),
     category: z
       .string()
+      .trim()
+      .min(1)
+      .max(32)
       .default("general")
       .describe(`Category: ${categories.join(", ")}`),
     tags: tagsSchema.describe("Optional tags for filtering"),
@@ -1097,8 +1290,14 @@ function createServer(env: Env) {
       };
     }
 
-    // Generate embedding
-    const vector = await embed(env.AI, content);
+    let vector: number[] | undefined;
+    if (!force) {
+      try {
+        vector = await embed(env.AI, content);
+      } catch (error) {
+        console.warn("dedup_embedding_failed", { error: errorMessage(error) });
+      }
+    }
 
     // Dedup check
     if (!force) {
@@ -1157,12 +1356,15 @@ function createServer(env: Env) {
 
   // ── update_memory ─────────────────────────────────────────────────
   server.tool("update_memory", TOOL_DESC.update, {
-    id: z.number().describe("The memory ID to update"),
+    id: z.number().int().positive().describe("The memory ID to update"),
     content: contentSchema
       .optional()
       .describe("New content (re-embeds automatically)"),
     category: z
       .string()
+      .trim()
+      .min(1)
+      .max(32)
       .optional()
       .describe("New category"),
     tags: tagsValueSchema.optional()
@@ -1170,6 +1372,19 @@ function createServer(env: Env) {
     importance: importanceValueSchema.optional()
       .describe("New importance level"),
   }, async ({ id, content, category, tags, importance }) => {
+    if (
+      content === undefined &&
+      category === undefined &&
+      tags === undefined &&
+      importance === undefined
+    ) {
+      return {
+        content: [
+          { type: "text" as const, text: "At least one update field is required." },
+        ],
+      };
+    }
+
     // Validate category if provided
     if (category && !categories.includes(category)) {
       return {
@@ -1210,13 +1425,19 @@ function createServer(env: Env) {
     const contentHash =
       content !== undefined ? await hashContent(newContent) : existing.content_hash;
 
-    await env.DB.prepare(
+    const updateResult = await env.DB.prepare(
       `UPDATE memories
        SET content = ?, category = ?, tags = ?, importance = ?, content_hash = ?,
            vector_status = CASE WHEN ? THEN 'pending' ELSE vector_status END,
            vector_error = CASE WHEN ? THEN NULL ELSE vector_error END,
+           vector_generation = vector_generation + CASE WHEN ? THEN 1 ELSE 0 END,
+           maintenance_owner = NULL, maintenance_expires_at = NULL,
            updated_at = datetime('now')
-       WHERE id = ?`
+       WHERE id = ?
+         AND content IS ? AND category IS ? AND tags IS ?
+         AND importance IS ? AND content_hash IS ? AND vector_generation = ?
+         AND (maintenance_owner IS NULL OR maintenance_expires_at < datetime('now'))
+       RETURNING *`
     )
       .bind(
         newContent,
@@ -1226,27 +1447,45 @@ function createServer(env: Env) {
         contentHash,
         needsUpsert ? 1 : 0,
         needsUpsert ? 1 : 0,
-        id
+        needsUpsert ? 1 : 0,
+        id,
+        existing.content,
+        existing.category,
+        existing.tags,
+        existing.importance,
+        existing.content_hash,
+        existing.vector_generation
       )
-      .run();
+      .first<Memory>();
+    if (!updateResult) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Memory ${id} changed concurrently or is temporarily locked. Read it again and retry.`,
+          },
+        ],
+      };
+    }
 
     // Re-upsert when content OR vector metadata changed — stale category
     // metadata silently breaks category-filtered recall.
+    let indexingReady = true;
     if (needsUpsert) {
-      await indexMemory(env, {
-        id,
-        content: newContent,
-        category: newCategory,
-        source: existing.source,
-        importance: newImportance,
-      });
+      indexingReady = (await indexMemory(env, updateResult)).ready;
     }
 
     return {
       content: [
         {
           type: "text" as const,
-          text: `Memory ${id} updated.${needsUpsert ? " (re-embedded)" : ""}`,
+          text: `Memory ${id} updated.${
+            needsUpsert
+              ? indexingReady
+                ? " (re-embedded)"
+                : " Semantic indexing is pending and will be retried automatically."
+              : ""
+          }`,
         },
       ],
     };
@@ -1254,13 +1493,17 @@ function createServer(env: Env) {
 
   // ── recall ────────────────────────────────────────────────────────
   server.tool("recall", TOOL_DESC.recall, {
-    query: z.string().describe("Natural language search query"),
+    query: z.string().trim().min(1).max(2_000).describe("Natural language search query"),
     category: z
       .string()
+      .trim()
+      .min(1)
+      .max(32)
       .optional()
       .describe("Optional: filter by category"),
     limit: z
       .number()
+      .int()
       .min(1)
       .max(20)
       .default(5)
@@ -1299,10 +1542,14 @@ function createServer(env: Env) {
     {
       category: z
         .string()
+        .trim()
+        .min(1)
+        .max(32)
         .optional()
         .describe("Optional: filter by category"),
       limit: z
         .number()
+        .int()
         .min(1)
         .max(50)
         .default(10)
@@ -1352,9 +1599,10 @@ function createServer(env: Env) {
     "search_by_tag",
     "Search memories by tag.",
     {
-      tag: z.string().describe("Tag to search for"),
+      tag: z.string().trim().min(1).max(MAX_TAG_LENGTH).describe("Tag to search for"),
       limit: z
         .number()
+        .int()
         .min(1)
         .max(50)
         .default(10)
@@ -1391,7 +1639,7 @@ function createServer(env: Env) {
     "forget",
     "Delete a memory by ID. This is permanent.",
     {
-      id: z.number().describe("The memory ID to delete"),
+      id: z.number().int().positive().describe("The memory ID to delete"),
     },
     async ({ id }) => {
       const existing = await env.DB.prepare(
@@ -1408,7 +1656,16 @@ function createServer(env: Env) {
         };
       }
 
-      await deleteMemory(env, id);
+      if (!(await deleteMemory(env, id))) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Memory ${id} is temporarily locked for maintenance. Try again shortly.`,
+            },
+          ],
+        };
+      }
 
       return {
         content: [
@@ -1422,11 +1679,14 @@ function createServer(env: Env) {
   server.tool("review_stale", TOOL_DESC.review_stale, {
     days: z
       .number()
+      .int()
       .min(1)
+      .max(36_500)
       .default(STALE_DAYS)
       .describe("Number of days without access to consider stale"),
     limit: z
       .number()
+      .int()
       .min(1)
       .max(50)
       .default(20)
@@ -1530,6 +1790,53 @@ function createServer(env: Env) {
 }
 
 // ── Nightly Consolidation (opt-in via cron trigger) ───────────────────
+async function reserveMemories(
+  env: Env,
+  memories: Array<Pick<Memory, "id" | "updated_at">>,
+  owner: string
+): Promise<boolean> {
+  const results = await env.DB.batch(
+    memories.map((memory) =>
+      env.DB.prepare(
+        `UPDATE memories
+         SET maintenance_owner = ?,
+             maintenance_expires_at = datetime('now', '+15 minutes')
+         WHERE id = ? AND updated_at = ?
+           AND (maintenance_owner IS NULL OR maintenance_expires_at < datetime('now'))`
+      ).bind(owner, memory.id, memory.updated_at)
+    )
+  );
+  const reserved = results.every((result) => (result.meta.changes || 0) === 1);
+  if (!reserved) await releaseMemoryReservations(env, owner);
+  return reserved;
+}
+
+async function refreshMemoryReservations(
+  env: Env,
+  owner: string,
+  expected: number
+): Promise<boolean> {
+  const { results } = await env.DB.prepare(
+    `UPDATE memories
+     SET maintenance_expires_at = datetime('now', '+15 minutes')
+     WHERE maintenance_owner = ?
+     RETURNING id`
+  )
+    .bind(owner)
+    .all();
+  return results.length === expected;
+}
+
+async function releaseMemoryReservations(env: Env, owner: string) {
+  await env.DB.prepare(
+    `UPDATE memories
+     SET maintenance_owner = NULL, maintenance_expires_at = NULL
+     WHERE maintenance_owner = ?`
+  )
+    .bind(owner)
+    .run();
+}
+
 async function acquireMaintenanceLock(
   env: Env,
   name: string,
@@ -1573,8 +1880,11 @@ async function runConsolidation(env: Env) {
     const { results: allMemories } = await env.DB.prepare(
       `SELECT id, category FROM memories
        WHERE pinned = 0 AND vector_status = 'ready'
-       ORDER BY created_at DESC LIMIT 20`
-    ).all();
+         AND (maintenance_owner IS NULL OR maintenance_expires_at < datetime('now'))
+       ORDER BY created_at DESC LIMIT ?`
+    )
+      .bind(MAX_CONSOLIDATION_SEEDS)
+      .all();
     if (!allMemories || allMemories.length < 2) return;
 
     for (const memory of allMemories as unknown as Memory[]) {
@@ -1608,25 +1918,37 @@ async function runConsolidation(env: Env) {
       const placeholders = clusterIds.map(() => "?").join(",");
       const { results } = await env.DB.prepare(
         `SELECT * FROM memories
-         WHERE id IN (${placeholders}) AND pinned = 0 AND category = ?`
+         WHERE id IN (${placeholders}) AND pinned = 0 AND category = ?
+           AND (maintenance_owner IS NULL OR maintenance_expires_at < datetime('now'))`
       )
         .bind(...clusterIds, memory.category)
         .all();
       const clusterMemories = results as unknown as Memory[];
       if (clusterMemories.length < 2) continue;
+      if (!(await reserveMemories(env, clusterMemories, owner))) continue;
 
-      const run = await env.DB.prepare(
-        `INSERT INTO consolidation_runs (source_ids, category, status)
-         VALUES (?, ?, 'started') RETURNING id`
-      )
-        .bind(
-          JSON.stringify(clusterMemories.map((item) => item.id)),
-          memory.category
-      )
-        .first<{ id: number }>();
-      if (!run) continue;
+      let run: { id: number } | null;
+      try {
+        run = await env.DB.prepare(
+          `INSERT INTO consolidation_runs (source_ids, category, status)
+           VALUES (?, ?, 'started') RETURNING id`
+        )
+          .bind(
+            JSON.stringify(clusterMemories.map((item) => item.id)),
+            memory.category
+          )
+          .first<{ id: number }>();
+      } catch (error) {
+        await releaseMemoryReservations(env, owner);
+        throw error;
+      }
+      if (!run) {
+        await releaseMemoryReservations(env, owner);
+        continue;
+      }
 
       let consolidatedId: number | null = null;
+      let sourcesCommitted = false;
       try {
         const payload = clusterMemories.map((item) => ({
           id: item.id,
@@ -1649,9 +1971,12 @@ async function runConsolidation(env: Env) {
         if (merged.length < 5 || merged.length > MAX_CONTENT_LENGTH) {
           throw new Error("Consolidation produced invalid output");
         }
+        if (!(await refreshMemoryReservations(env, owner, clusterMemories.length))) {
+          throw new Error("Consolidation sources changed during processing");
+        }
 
         const maxImportance = Math.max(
-          ...clusterMemories.map((item) => item.importance)
+          ...clusterMemories.map((item) => safeImportance(item.importance))
         );
         const tags = new Set<string>();
         for (const item of clusterMemories) {
@@ -1666,31 +1991,39 @@ async function runConsolidation(env: Env) {
             .filter((value): value is string => !!value)
             .sort()
             .pop() || null;
+        const resultOwner = `consolidation-result:${run.id}:${crypto.randomUUID()}`;
 
         const consolidated = await env.DB.prepare(
           `INSERT INTO memories
             (content, category, tags, importance, source, content_hash,
-             vector_status, consolidated_from, access_count, last_accessed_at)
-           VALUES (?, ?, ?, ?, 'consolidation', ?, 'pending', ?, ?, ?)
+             vector_status, consolidated_from, access_count, last_accessed_at,
+             maintenance_owner, maintenance_expires_at)
+           VALUES (?, ?, ?, ?, 'consolidation', ?, 'pending', ?, ?, ?, ?,
+                   datetime('now', '+15 minutes'))
            RETURNING *`
         )
           .bind(
             merged,
             memory.category,
-            JSON.stringify([...tags]),
+            JSON.stringify([...tags].slice(0, MAX_TAGS)),
             maxImportance,
             await hashContent(merged),
             JSON.stringify(clusterMemories.map((item) => item.id)),
             maxAccessCount,
-            lastAccessed
+            lastAccessed,
+            resultOwner
         )
           .first<Memory>();
         if (!consolidated) throw new Error("Failed to insert consolidated memory");
         consolidatedId = consolidated.id;
 
-        const indexed = await indexMemory(env, consolidated);
+        const indexed = await indexMemory(
+          env,
+          consolidated,
+          undefined,
+          resultOwner
+        );
         if (!indexed.ready) {
-          await deleteMemory(env, consolidated.id);
           throw new Error("Failed to index consolidated memory; originals retained");
         }
 
@@ -1703,15 +2036,30 @@ async function runConsolidation(env: Env) {
              SELECT id, content, category, tags, importance, source, pinned,
                     access_count, last_accessed_at, created_at, updated_at,
                     consolidated_from, ?
-             FROM memories WHERE id = ?`
-          ).bind(consolidated.id, item.id)
+             FROM memories WHERE id = ? AND maintenance_owner = ?`
+          ).bind(consolidated.id, item.id, owner)
         );
         const deleteStatements = clusterMemories.map((item) =>
-          env.DB.prepare("DELETE FROM memories WHERE id = ?").bind(item.id)
+          env.DB.prepare(
+            "DELETE FROM memories WHERE id = ? AND maintenance_owner = ?"
+          ).bind(item.id, owner)
+        );
+        const tombstoneStatements = clusterMemories.map((item) =>
+          env.DB.prepare(
+            `INSERT INTO vector_tombstones (memory_id)
+             VALUES (?)
+             ON CONFLICT(memory_id) DO UPDATE SET updated_at = datetime('now')`
+          ).bind(item.id.toString())
         );
         await env.DB.batch([
           ...archiveStatements,
+          ...tombstoneStatements,
           ...deleteStatements,
+          env.DB.prepare(
+            `UPDATE memories
+             SET maintenance_owner = NULL, maintenance_expires_at = NULL
+             WHERE id = ? AND maintenance_owner = ?`
+          ).bind(consolidated.id, resultOwner),
           env.DB.prepare(
             `UPDATE consolidation_runs
              SET status = 'completed', result_memory_id = ?,
@@ -1719,6 +2067,7 @@ async function runConsolidation(env: Env) {
              WHERE id = ?`
           ).bind(consolidated.id, run.id),
         ]);
+        sourcesCommitted = true;
 
         await deleteVectorsWithRetry(
           env,
@@ -1729,13 +2078,23 @@ async function runConsolidation(env: Env) {
         mergeCount++;
       } catch (error) {
         const message = errorMessage(error);
+        if (sourcesCommitted) {
+          console.error("consolidation_postcommit_failed", {
+            run_id: run.id,
+            error: message,
+          });
+          await releaseMemoryReservations(env, owner);
+          continue;
+        }
         if (consolidatedId !== null) {
           const stillActive = await env.DB.prepare(
-            "SELECT id FROM memories WHERE id = ?"
+            "SELECT maintenance_owner FROM memories WHERE id = ?"
           )
             .bind(consolidatedId)
-            .first();
-          if (stillActive) await deleteMemory(env, consolidatedId);
+            .first<{ maintenance_owner: string | null }>();
+          if (stillActive?.maintenance_owner?.startsWith("consolidation-result:")) {
+            await deleteMemory(env, consolidatedId, stillActive.maintenance_owner);
+          }
         }
         await env.DB.prepare(
           `UPDATE consolidation_runs
@@ -1749,6 +2108,7 @@ async function runConsolidation(env: Env) {
           error: message,
         });
       }
+      await releaseMemoryReservations(env, owner);
     }
   } finally {
     await releaseMaintenanceLock(env, "consolidation", owner);
@@ -1773,8 +2133,7 @@ function checkAuth(request: Request, env: Env): Response | null {
   const authHeader = request.headers.get("Authorization");
   const bearer = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
   const allowQueryAuth =
-    env.ALLOW_QUERY_AUTH === "true" &&
-    (url.pathname === "/mcp" || url.pathname === "/sse");
+    env.ALLOW_QUERY_AUTH === "true" && url.pathname === "/mcp";
   const querySecret = allowQueryAuth ? url.searchParams.get("secret") : null;
   const token = bearer || querySecret;
 
@@ -2001,7 +2360,7 @@ async function doLogin(){
     if(document.getElementById('rememberSecret').checked){localStorage.setItem('memory_secret',SECRET)}
     else{localStorage.removeItem('memory_secret')}
     secretInput.value='';
-    showApp();
+    await showApp();
   }catch(e){errEl.textContent=e.message||'Connection failed';errEl.style.display='block'}
 }
 
@@ -2213,7 +2572,7 @@ function esc(s){const d=document.createElement('div');d.textContent=s;return d.i
       const r=await api('/api/categories');
       CATEGORIES=r.categories;
       document.getElementById('rememberSecret').checked=!!persisted;
-      showApp();
+      await showApp();
     }catch(e){
       document.getElementById('loginScreen').style.display='flex';
     }
@@ -2334,7 +2693,7 @@ export default {
     }
 
     // MCP endpoint
-    if (url.pathname === "/mcp" || url.pathname === "/sse") {
+    if (url.pathname === "/mcp") {
       const authResponse = checkAuth(request, env);
       if (authResponse) return applyCors(authResponse, request, env);
 
@@ -2354,7 +2713,7 @@ export default {
   ): Promise<void> {
     ctx.waitUntil(
       (async () => {
-        await repairVectorIndex(env);
+        await repairVectorIndex(env, SCHEDULED_REPAIR_BATCH);
         await runConsolidation(env);
       })()
     );

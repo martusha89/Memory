@@ -299,11 +299,9 @@ doc.add_paragraph(
 )
 
 add_note(
-    'If you get an authentication error with this command, try this alternative instead:\n'
-    'npx wrangler d1 execute memory-db --remote --command="CREATE TABLE IF NOT EXISTS memories '
-    '(id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL, category TEXT NOT NULL DEFAULT '
-    '\'general\', tags TEXT DEFAULT \'[]\', source TEXT DEFAULT \'unknown\', created_at TEXT NOT NULL '
-    'DEFAULT (datetime(\'now\')), updated_at TEXT NOT NULL DEFAULT (datetime(\'now\')));"'
+    'If you get an authentication error, run npx wrangler login and then rerun '
+    'the schema.sql command. Do not create a partial table manually: the current '
+    'server also needs its search, archive, repair, and maintenance tables.'
 )
 
 doc.add_page_break()
@@ -311,7 +309,7 @@ doc.add_page_break()
 # ═══════════════════════════════════════════════════════════════
 # PART 8
 # ═══════════════════════════════════════════════════════════════
-doc.add_heading('Part 8: Set a Password (Recommended)', level=1)
+doc.add_heading('Part 8: Set a Password (Required)', level=1)
 
 doc.add_paragraph(
     'This protects your memory server so only you (and your AI) can access it.'
@@ -348,8 +346,8 @@ p = doc.add_paragraph()
 run = p.add_run('Copy this URL and save it. This is your memory server\'s address.')
 run.bold = True
 
-add_step(2, 'To test it, open that URL in your browser. You should see:')
-add_code('{"status":"ok","name":"Memory","version":"1.0.0"}')
+add_step(2, 'To test it, open that URL with /health on the end in your browser. You should see:')
+add_code('{"status":"ok","name":"Memory","version":"2.3.0"}')
 
 doc.add_paragraph('If you see that, everything is working. Your memory server is live.')
 
@@ -378,7 +376,13 @@ add_code(
     '{\n'
     '  "mcpServers": {\n'
     '    "memory": {\n'
-    '      "url": "https://memory-server.YOUR-SUBDOMAIN.workers.dev/sse?secret=YOUR_PASSWORD"\n'
+    '      "command": "npx",\n'
+    '      "args": [\n'
+    '        "-y", "mcp-remote",\n'
+    '        "https://memory-server.YOUR-SUBDOMAIN.workers.dev/mcp",\n'
+    '        "--header", "Authorization: Bearer ${MEMORY_SECRET}"\n'
+    '      ],\n'
+    '      "env": { "MEMORY_SECRET": "YOUR_PASSWORD" }\n'
     '    }\n'
     '  }\n'
     '}'
@@ -399,8 +403,9 @@ doc.add_heading('Option B: Claude Code (Terminal)', level=2)
 
 add_step(1, 'Open your terminal and type:')
 add_code(
-    'claude mcp add memory --transport sse '
-    '"https://memory-server.YOUR-SUBDOMAIN.workers.dev/sse?secret=YOUR_PASSWORD"'
+    'claude mcp add memory --transport http '
+    '--header "Authorization: Bearer YOUR_PASSWORD" '
+    '"https://memory-server.YOUR-SUBDOMAIN.workers.dev/mcp"'
 )
 add_step(2, 'Replace YOUR-SUBDOMAIN and YOUR_PASSWORD as described above.')
 doc.add_paragraph('That\'s it. Claude Code will now have access to your memory tools.')
@@ -411,9 +416,10 @@ doc.add_heading('Option C: Other AI Apps That Support MCP', level=2)
 doc.add_paragraph(
     'Any app that supports the Model Context Protocol can connect. You\'ll need to provide:'
 )
-doc.add_paragraph('URL:  https://memory-server.YOUR-SUBDOMAIN.workers.dev/sse')
-doc.add_paragraph('Authentication:  Add ?secret=YOUR_PASSWORD to the URL, or set an '
-    'Authorization header with the value "Bearer YOUR_PASSWORD".')
+doc.add_paragraph('URL:  https://memory-server.YOUR-SUBDOMAIN.workers.dev/mcp')
+doc.add_paragraph('Authentication:  Set an Authorization header with the value '
+    '"Bearer YOUR_PASSWORD". Query-string passwords are disabled by default because '
+    'URLs can be retained in logs and browser history.')
 
 doc.add_page_break()
 
@@ -564,13 +570,13 @@ doc.add_paragraph()
 doc.add_paragraph()
 p = doc.add_paragraph()
 p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-run = p.add_run('Made with create-memory-server')
+run = p.add_run('Memory v2.3 setup guide')
 run.font.size = Pt(9)
 run.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
 
 p = doc.add_paragraph()
 p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-run = p.add_run('https://github.com/YOUR-USERNAME/memory')
+run = p.add_run('https://github.com/martusha89/Memory')
 run.font.size = Pt(9)
 run.font.color.rgb = RGBColor(0x05, 0x63, 0xC1)
 

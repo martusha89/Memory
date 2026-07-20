@@ -8,9 +8,18 @@ ALTER TABLE memories ADD COLUMN vector_status TEXT NOT NULL DEFAULT 'pending'
   CHECK (vector_status IN ('pending', 'ready', 'error'));
 ALTER TABLE memories ADD COLUMN vector_error TEXT DEFAULT NULL;
 ALTER TABLE memories ADD COLUMN vector_updated_at TEXT DEFAULT NULL;
+ALTER TABLE memories ADD COLUMN vector_generation INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE memories ADD COLUMN restored_from_archive_id INTEGER DEFAULT NULL;
+ALTER TABLE memories ADD COLUMN maintenance_owner TEXT DEFAULT NULL;
+ALTER TABLE memories ADD COLUMN maintenance_expires_at TEXT DEFAULT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_memories_content_hash ON memories(content_hash);
 CREATE INDEX IF NOT EXISTS idx_memories_vector_status ON memories(vector_status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_restored_from_archive
+  ON memories(restored_from_archive_id)
+  WHERE restored_from_archive_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_memories_maintenance_expiry
+  ON memories(maintenance_expires_at);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
   content,
@@ -67,8 +76,6 @@ CREATE TABLE IF NOT EXISTS consolidation_runs (
   completed_at TEXT DEFAULT NULL
 );
 
--- Existing vectors predate status tracking. Mark them ready; operators can
--- run repair_index to verify/rebuild them explicitly.
-UPDATE memories
-SET vector_status = 'ready', vector_updated_at = datetime('now')
-WHERE vector_status = 'pending';
+-- Existing rows intentionally remain pending. Lexical recall remains available
+-- while repair_index verifies and refreshes semantic vectors in bounded batches
+-- (including metadata used by category-filtered recall).

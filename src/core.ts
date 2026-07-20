@@ -72,7 +72,10 @@ export function safeStringArray(value: string | null | undefined): string[] {
   try {
     const parsed = JSON.parse(value || "[]");
     return Array.isArray(parsed)
-      ? parsed.filter((item): item is string => typeof item === "string")
+      ? parsed
+          .filter((item): item is string => typeof item === "string")
+          .slice(0, MAX_TAGS)
+          .map((item) => item.slice(0, MAX_TAG_LENGTH))
       : [];
   } catch {
     return [];
@@ -83,7 +86,9 @@ export function safeNumberArray(value: string | null | undefined): number[] {
   try {
     const parsed = JSON.parse(value || "[]");
     return Array.isArray(parsed)
-      ? parsed.filter((item): item is number => Number.isInteger(item))
+      ? parsed
+          .filter((item): item is number => Number.isInteger(item))
+          .slice(0, 100)
       : [];
   } catch {
     return [];
@@ -97,6 +102,17 @@ export function ftsQuery(input: string): string | null {
     ?.slice(0, 12);
   if (!tokens?.length) return null;
   return tokens.map((token) => `"${token.replace(/"/g, '""')}"`).join(" OR ");
+}
+
+export function likePattern(input: string): string | null {
+  const encoder = new TextEncoder();
+  let escaped = "";
+  for (const character of input.trim()) {
+    const next = escaped + (/[\\%_]/.test(character) ? `\\${character}` : character);
+    if (encoder.encode(`%${next}%`).length > 50) break;
+    escaped = next;
+  }
+  return escaped ? `%${escaped}%` : null;
 }
 
 export function formatZodError(error: z.ZodError): string {

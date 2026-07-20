@@ -114,9 +114,11 @@ Enable by uncommenting the `[triggers]` block in `wrangler.toml`:
 crons = ["0 2 * * *"]  # 2:00 AM UTC
 ```
 
-**Free tier note:** Consolidation processes at most 5 clusters from a bounded
-20-memory seed set per run. Archive/delete work is sent to D1 as transactional
-batches and Vectorize deletes are batched.
+**Free tier note:** Consolidation processes at most 1 cluster from a bounded
+10-memory seed set per run. Archive/delete work is sent to D1 as transactional
+batches, Vectorize deletes are batched, and scheduled vector repair is limited
+to 3 candidates so the combined maintenance invocation stays within D1's free
+per-invocation query budget.
 
 ## Manual Setup
 
@@ -125,7 +127,7 @@ If you prefer to set things up manually instead of using the CLI:
 ### Prerequisites
 
 - A [Cloudflare account](https://dash.cloudflare.com/sign-up) (free tier works)
-- [Node.js](https://nodejs.org/) 18+
+- [Node.js](https://nodejs.org/) 20+
 - [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/install-and-update/) (`npm install -g wrangler`)
 
 ### 1. Clone and install
@@ -168,10 +170,12 @@ npm run deploy
 
 ### Upgrading from v2.1.x or earlier
 
-Databases created before v2.2.0 need a one-time migration (adds the `pinned` column and the consolidation archive table):
+Run both migrations in order before deploying v2.3. The first creates the v2.2
+`pinned` and archive schema; the second adds all v2.3 hardening state:
 
 ```bash
 npx wrangler d1 execute memory-db --remote --file=migrations/2026-06-12-pinned-and-archive.sql
+npm run db:migrate:hardening
 ```
 
 ### Upgrading from v2.2.x
@@ -183,8 +187,11 @@ npm run db:migrate:hardening
 ```
 
 The migration adds FTS5 search, vector repair state, recoverable consolidation
-metadata, and maintenance locks. Take a D1 backup before any production schema
-migration.
+metadata, and maintenance locks. Existing records remain available to lexical
+recall immediately, but semantic scoring is deliberately withheld while their
+new tracking state is `pending`. After deployment, call `repair_index` in bounded
+batches until it reports `inspected: 0` before relying on semantic recall again.
+Take a D1 backup before any production schema migration.
 
 ### Local development
 
@@ -234,9 +241,7 @@ Add as a remote MCP server in Claude settings:
 
 ### Any MCP Client
 
-The server exposes two MCP-compatible endpoints:
-- `/mcp` — Streamable HTTP transport
-- `/sse` — SSE transport
+The server exposes `/mcp` using the Streamable HTTP transport.
 
 Authenticate with `Authorization: Bearer YOUR_SECRET`. Query-string secrets are
 disabled by default because URLs are commonly retained in history and logs. If
@@ -263,14 +268,17 @@ Consolidation (nightly, opt-in):
   → batched vector cleanup; failures recorded for retry
 ```
 
-The embedding model (`@cf/baai/bge-base-en-v1.5`) runs on Cloudflare's edge via Workers AI — no external API calls, no extra billing.
+The embedding model (`@cf/baai/bge-base-en-v1.5`) runs on Cloudflare's edge via
+Workers AI, so no external model API key is needed. Its usage counts against
+your Workers AI allocation and can be billable above the included allowance on
+a paid Workers plan.
 
 ## Cost
 
 On the **Cloudflare free tier** you get:
 
 - **D1**: 5M rows read, 100K rows written per day
-- **Vectorize**: 30M queried vector dimensions, 10M stored vector dimensions per month
+- **Vectorize**: 30M queried vector dimensions per month, 5M stored vector dimensions
 - **Workers AI**: 10,000 neurons per day
 - **Workers**: 100K requests per day
 

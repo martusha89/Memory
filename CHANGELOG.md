@@ -17,10 +17,23 @@
 - Add D1 FTS5 lexical retrieval and hybrid reranking for immediate
   read-after-write recall.
 - Track vector indexing state and retry failed upserts/deletes.
+- Keep D1 writes available when embedding or semantic deduplication is
+  temporarily unavailable; failed indexing remains queued for repair.
 - Make consolidation bounded, locked, logged, and transactionally archive its
   source rows before batched vector cleanup.
+- Reserve consolidation sources so concurrent edits or deletes abort safely,
+  and keep the replacement active after the archive transaction commits.
 - Add archive listing and idempotent restore through REST, MCP, and the web UI.
+- Enforce archive-restore idempotency with an active-row uniqueness claim.
 - Add deep authenticated health data and exact JSON tag matching.
+- Mark pre-v2.3 rows pending so operators can verify and refresh existing
+  Vectorize entries in bounded batches.
+- Recheck semantic candidates against authoritative D1 category/vector state,
+  bound LIKE fallbacks, and rotate retry timestamps to prevent starvation.
+- Serialize indexing with per-memory leases and generations so stale embeddings
+  cannot win races with edits or deletes.
+- Reject stale read-modify-write updates and keep consolidation replacements
+  owned until their source archive transaction commits.
 
 ### Tooling
 
@@ -29,3 +42,7 @@
   audit-clean lockfile.
 - Warn against the outdated `create-memory-server@1.1.0` installer until a
   matching CLI release is published.
+- Update the generated setup guide to require authentication, use Bearer
+  headers, test `/health`, and avoid incomplete fallback schemas.
+- Advertise only the working Streamable HTTP endpoint and allow the standard
+  MCP CORS request/session headers.

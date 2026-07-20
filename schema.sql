@@ -11,9 +11,13 @@ CREATE TABLE IF NOT EXISTS memories (
     CHECK (vector_status IN ('pending', 'ready', 'error')),
   vector_error TEXT DEFAULT NULL,
   vector_updated_at TEXT DEFAULT NULL,
+  vector_generation INTEGER NOT NULL DEFAULT 0,
   access_count INTEGER NOT NULL DEFAULT 0,
   last_accessed_at TEXT DEFAULT NULL,
   consolidated_from TEXT DEFAULT NULL,
+  restored_from_archive_id INTEGER DEFAULT NULL,
+  maintenance_owner TEXT DEFAULT NULL,
+  maintenance_expires_at TEXT DEFAULT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -25,6 +29,11 @@ CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance);
 CREATE INDEX IF NOT EXISTS idx_memories_last_accessed ON memories(last_accessed_at);
 CREATE INDEX IF NOT EXISTS idx_memories_content_hash ON memories(content_hash);
 CREATE INDEX IF NOT EXISTS idx_memories_vector_status ON memories(vector_status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_restored_from_archive
+  ON memories(restored_from_archive_id)
+  WHERE restored_from_archive_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_memories_maintenance_expiry
+  ON memories(maintenance_expires_at);
 
 -- D1-backed lexical search complements eventually-consistent Vectorize and
 -- guarantees that newly-written memories can be found immediately.
