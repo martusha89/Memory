@@ -18,7 +18,7 @@ Built on **Cloudflare Workers** + **D1** (SQLite) + **Vectorize** (semantic sear
 npx create-memory-server
 ```
 
-That's it. The CLI walks you through everything — creates your Cloudflare resources, deploys the server, and configures Claude. Done in 2 minutes.
+The installer creates the Cloudflare resources, deploys the server, and configures a supported MCP client. Review the generated resource names and secret handling before deployment.
 
 ## What It Does
 
@@ -39,9 +39,9 @@ Your AI gets 8 tools:
 
 ### Smart Deduplication
 
-When you store a memory, the server checks for semantically similar existing memories (cosine similarity > 0.85). If a near-duplicate exists, it tells you — with the option to update the existing memory instead. No more storing "user likes dark mode" twenty times.
+Exact duplicates are detected from a normalized SHA-256 content hash and blocked unless `force=true`. Semantic similarity is advisory rather than destructive: a correction or contradiction can be very close to the claim it replaces, so related memories are stored and reported for review.
 
-Storing with `force=true` **pins** the memory: it marks "I know this looks similar, keep it separate", and nightly consolidation will never merge it away.
+`force=true` only permits a separate exact copy. Use `pinned=true` independently to mark a memory as protected.
 
 ### Importance Levels
 
@@ -75,25 +75,28 @@ Customize by setting `MEMORY_CATEGORIES` in `wrangler.toml` (comma-separated).
 
 ### Access Tracking
 
-Every time a memory is recalled, its `last_accessed_at` timestamp and `access_count` are updated. This powers the stale memory detection and helps you understand which memories are actually useful.
+Returned recall results update `last_accessed_at` and `access_count`. This measures retrieval exposure, not confirmation or truth; use stale review as a maintenance hint rather than an automatic deletion rule.
 
-### Nightly Consolidation (Opt-In)
+### Repairable Vector Index
 
-Enable a cron job that runs nightly to:
+D1 is the canonical record store. Every create, update, and delete atomically writes an `index_outbox` event through database triggers. Vectorize is an asynchronous projection:
 
-1. **Find duplicate clusters** — memories with >85% semantic similarity, within the same category only
-2. **Merge them** — uses Workers AI (Llama 3.1 8B) to intelligently combine related memories into one richer entry
-3. **Archive the originals** — source memories are moved to `memories_archive` (not deleted), so nothing is ever lost if the merge drops a detail
-4. **Track lineage** — merged memories store which originals they came from; pinned memories (`force=true`) are never touched
+1. Mutations commit to D1 and immutable `memory_versions` first.
+2. The outbox worker embeds and projects the current record version.
+3. Vectors carry the D1 record version and content hash.
+4. Recall rejects stale vectors and still finds pending records through lexical FTS.
+5. Failed projections remain visible and retry with backoff.
 
-Enable by uncommenting the `[triggers]` block in `wrangler.toml`:
+Enable the scheduled reconciliation worker by uncommenting `[triggers]`:
 
 ```toml
 [triggers]
-crons = ["0 2 * * *"]  # 2:00 AM UTC
+crons = ["*/15 * * * *"]
 ```
 
-**Free tier note:** The consolidation uses Workers AI (10,000 neurons/day free) and is subject to the 50-subrequest limit on the free Workers plan. It processes up to 20 clusters per run and catches up over multiple nights if needed.
+You can also request an authenticated repair batch with `POST /api/index/reconcile` and an optional JSON body such as `{ "limit": 50 }`.
+
+The previous automatic LLM consolidation routine is disabled. It destructively replaced active source memories and could not guarantee atomic rollback across D1 and Vectorize. Future consolidation should create reversible proposals rather than rewrite canonical history.
 
 ## Manual Setup
 
@@ -143,13 +146,18 @@ The secret is **required** — the server refuses all API/MCP requests (503) unt
 npm run deploy
 ```
 
-### Upgrading from v2.1.x or earlier
+### Upgrading to v3
+
+Back up D1, upgrade a v2.1 database to v2.2 if necessary, then apply the v3 migration:
 
 Databases created before v2.2.0 need a one-time migration (adds the `pinned` column and the consolidation archive table):
 
 ```bash
 npx wrangler d1 execute memory-db --remote --file=migrations/2026-06-12-pinned-and-archive.sql
+npx wrangler d1 execute memory-db --remote --file=migrations/2026-08-21-v3-safety-foundation.sql
 ```
+
+The v3 migration is a one-time migration. It adds immutable versions, projection state, an indexing outbox, and FTS. Existing rows are queued for reindexing; enable the scheduler or call the reconciliation endpoint until the backlog is clear.
 
 ### Local development
 
@@ -193,22 +201,21 @@ The server exposes two MCP-compatible endpoints:
 - `/mcp` — Streamable HTTP transport
 - `/sse` — SSE transport
 
-Auth via `Authorization: Bearer YOUR_SECRET` header or `?secret=YOUR_SECRET` query parameter.
+Prefer `Authorization: Bearer YOUR_SECRET`. Query-string secrets are accepted only on MCP endpoints for client compatibility; URLs can leak through logs, history, screenshots, and copied configuration. Use a dedicated strong secret and rotate it if exposed. The REST API does not accept query-string authentication.
 
 ## How It Works
 
 ```
-Store: content → D1 (full record) + AI embed → Vectorize (vector)
-         ↘ dedup check: Vectorize query (>0.85 = similar exists)
+Store/update/delete: D1 mutation
+  → immutable memory_versions snapshot + index_outbox event (same D1 commit)
+  → projection attempt → Vectorize(version + content hash)
+  → failed attempts remain queued for repair
 
-Recall: query → AI embed → Vectorize (top-K, importance-weighted)
-                         → drop matches below 0.55 similarity
-                         → D1 (full records) + update access tracking
-                         ↘ no good matches: D1 keyword LIKE search
-
-Consolidation (nightly, opt-in):
-  for each unpinned memory → Vectorize queryById (same-category clusters)
-  → Workers AI merges cluster → archive originals → insert consolidated memory
+Recall: query → semantic candidates from Vectorize
+              + lexical candidates from D1 FTS (always, not fallback-only)
+              → reject stale vector versions and inactive records
+              → hybrid reranking with a small importance prior
+              → update access tracking only for returned results
 ```
 
 The embedding model (`@cf/baai/bge-base-en-v1.5`) runs on Cloudflare's edge via Workers AI — no external API calls, no extra billing.

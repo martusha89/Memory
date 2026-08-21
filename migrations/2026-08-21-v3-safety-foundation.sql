@@ -1,47 +1,25 @@
-CREATE TABLE IF NOT EXISTS memories (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  content TEXT NOT NULL,
-  category TEXT NOT NULL DEFAULT 'general',
-  tags TEXT DEFAULT '[]',
-  importance INTEGER NOT NULL DEFAULT 3,
-  source TEXT DEFAULT 'unknown',
-  pinned INTEGER NOT NULL DEFAULT 0,
-  access_count INTEGER NOT NULL DEFAULT 0,
-  last_accessed_at TEXT DEFAULT NULL,
-  consolidated_from TEXT DEFAULT NULL,
-  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'superseded', 'disputed', 'retracted')),
-  record_version INTEGER NOT NULL DEFAULT 1 CHECK (record_version >= 1),
-  content_hash TEXT NOT NULL DEFAULT '',
-  dedupe_key TEXT DEFAULT NULL,
-  indexed_version INTEGER DEFAULT NULL,
-  index_status TEXT NOT NULL DEFAULT 'pending' CHECK (index_status IN ('pending', 'ready', 'failed')),
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-  CHECK (length(trim(content)) > 0),
-  CHECK (importance BETWEEN 1 AND 5),
-  CHECK (pinned IN (0, 1)),
-  CHECK (json_valid(tags)),
-  CHECK (consolidated_from IS NULL OR json_valid(consolidated_from))
-);
+-- v3 safety foundation. Apply once to a v2.2 database.
+-- Back up D1 before migration, then run:
+-- npx wrangler d1 execute memory-db --remote --file migrations/2026-08-21-v3-safety-foundation.sql
 
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version TEXT PRIMARY KEY,
   applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-INSERT OR IGNORE INTO schema_migrations(version) VALUES ('2026-08-21-v3-safety-foundation');
 
-CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
-CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
-CREATE INDEX IF NOT EXISTS idx_memories_source ON memories(source);
-CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance);
-CREATE INDEX IF NOT EXISTS idx_memories_last_accessed ON memories(last_accessed_at);
+ALTER TABLE memories ADD COLUMN status TEXT NOT NULL DEFAULT 'active';
+ALTER TABLE memories ADD COLUMN record_version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE memories ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE memories ADD COLUMN dedupe_key TEXT DEFAULT NULL;
+ALTER TABLE memories ADD COLUMN indexed_version INTEGER DEFAULT NULL;
+ALTER TABLE memories ADD COLUMN index_status TEXT NOT NULL DEFAULT 'pending';
+
 CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status);
 CREATE INDEX IF NOT EXISTS idx_memories_content_hash
   ON memories(content_hash) WHERE status = 'active' AND content_hash <> '';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_dedupe_key_active
   ON memories(dedupe_key) WHERE status = 'active' AND dedupe_key IS NOT NULL;
 
--- Immutable snapshots. Updates never erase what was previously believed.
 CREATE TABLE IF NOT EXISTS memory_versions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   memory_id INTEGER NOT NULL,
@@ -62,14 +40,13 @@ CREATE TABLE IF NOT EXISTS memory_versions (
 CREATE INDEX IF NOT EXISTS idx_memory_versions_memory
   ON memory_versions(memory_id, record_version DESC);
 
--- D1 is canonical. Vectorize is an asynchronously repairable projection.
 CREATE TABLE IF NOT EXISTS index_outbox (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   memory_id INTEGER NOT NULL,
   record_version INTEGER NOT NULL,
-  operation TEXT NOT NULL CHECK (operation IN ('upsert', 'delete')),
+  operation TEXT NOT NULL,
   content_hash TEXT NOT NULL,
-  state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'processing', 'complete', 'failed')),
+  state TEXT NOT NULL DEFAULT 'pending',
   attempts INTEGER NOT NULL DEFAULT 0,
   last_error TEXT DEFAULT NULL,
   next_attempt_at TEXT DEFAULT NULL,
@@ -81,6 +58,16 @@ CREATE TABLE IF NOT EXISTS index_outbox (
 
 CREATE INDEX IF NOT EXISTS idx_index_outbox_pending
   ON index_outbox(state, next_attempt_at, created_at);
+
+-- Snapshot all existing rows before triggers begin recording new versions.
+INSERT OR IGNORE INTO memory_versions
+  (memory_id, record_version, content, category, tags, importance, source, pinned, status, content_hash, change_kind)
+SELECT id, record_version, content, category, tags, importance, source, pinned, status, content_hash, 'migration'
+FROM memories;
+
+INSERT OR IGNORE INTO index_outbox
+  (memory_id, record_version, operation, content_hash)
+SELECT id, record_version, 'upsert', content_hash FROM memories;
 
 CREATE TRIGGER IF NOT EXISTS memories_version_after_insert
 AFTER INSERT ON memories
@@ -115,12 +102,12 @@ BEGIN
   VALUES (OLD.id, OLD.record_version + 1, 'delete', OLD.content_hash);
 END;
 
--- Lexical retrieval runs alongside semantic retrieval rather than only as a fallback.
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
   content,
   content='memories',
   content_rowid='id'
 );
+INSERT INTO memory_fts(memory_fts) VALUES ('rebuild');
 
 CREATE TRIGGER IF NOT EXISTS memories_fts_after_insert AFTER INSERT ON memories BEGIN
   INSERT INTO memory_fts(rowid, content) VALUES (NEW.id, NEW.content);
@@ -133,21 +120,5 @@ CREATE TRIGGER IF NOT EXISTS memories_fts_after_update AFTER UPDATE OF content O
   INSERT INTO memory_fts(rowid, content) VALUES (NEW.id, NEW.content);
 END;
 
--- Originals preserved by nightly consolidation (the AI merge is lossy —
--- never hard-delete the source memories).
-CREATE TABLE IF NOT EXISTS memories_archive (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  original_id INTEGER NOT NULL,
-  content TEXT NOT NULL,
-  category TEXT,
-  tags TEXT,
-  importance INTEGER,
-  source TEXT,
-  access_count INTEGER,
-  last_accessed_at TEXT,
-  created_at TEXT,
-  consolidated_into INTEGER,
-  archived_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_archive_consolidated_into ON memories_archive(consolidated_into);
+INSERT OR IGNORE INTO schema_migrations(version)
+VALUES ('2026-08-21-v3-safety-foundation');
