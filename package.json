@@ -1,11 +1,14 @@
 {
   "name": "@aidhd/memory-server",
-  "version": "2.2.0",
+  "version": "3.0.0",
   "description": "Persistent AI memory on Cloudflare — semantic search via MCP",
   "main": "src/index.ts",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test",
     "db:create": "wrangler d1 create memory-db",
     "db:schema": "wrangler d1 execute memory-db --remote --file=schema.sql",
     "db:schema:local": "wrangler d1 execute memory-db --local --file=schema.sql"
@@ -14,13 +17,14 @@
   "license": "SEE LICENSE IN LICENSE",
   "type": "commonjs",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.27.1",
-    "agents": "^0.6.0",
-    "wrangler": "^4.68.1",
-    "zod": "^4.3.6"
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "agents": "^0.21.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260304.0",
-    "typescript": "^5.9.3"
+    "@cloudflare/workers-types": "^5.20260820.1",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4",
+    "wrangler": "^4.125.0"
   }
 }

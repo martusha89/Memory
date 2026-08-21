@@ -1,6 +1,18 @@
 import { createMcpHandler } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import {
+  contentHash,
+  MAX_CONTENT_LENGTH,
+  MAX_TAG_LENGTH,
+  MAX_TAGS,
+  isProjectionCurrent,
+  normalizeTags,
+  positiveInt,
+  scoreRecallCandidate,
+  validateContent,
+  validateQuery,
+} from "./memory-core";
 
 // ── Types ─────────────────────────────────────────────────────────────
 interface Env {
@@ -22,21 +34,47 @@ interface Memory {
   access_count: number;
   last_accessed_at: string | null;
   consolidated_from: string | null;
+  status: "active" | "superseded" | "disputed" | "retracted";
+  record_version: number;
+  content_hash: string;
+  dedupe_key: string | null;
+  indexed_version: number | null;
+  index_status: "pending" | "ready" | "failed";
   created_at: string;
   updated_at: string;
 }
 
+interface IndexOutboxItem {
+  id: number;
+  memory_id: number;
+  record_version: number;
+  operation: "upsert" | "delete";
+  content_hash: string;
+  state: "pending" | "processing" | "complete" | "failed";
+  attempts: number;
+  locked_at: string | null;
+}
+
+interface RecallCandidate {
+  memory: Memory;
+  semanticScore: number;
+  lexicalScore: number;
+}
+
 // ── Constants ─────────────────────────────────────────────────────────
-const VERSION = "2.2.0";
+const VERSION = "3.0.0";
 const EMBEDDING_MODEL = "@cf/baai/bge-base-en-v1.5";
-const CONSOLIDATION_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast";
 const SIMILARITY_THRESHOLD = 0.85;
 // Vectorize always returns the topK nearest neighbors no matter how far
 // away they are — without a floor, recall returns junk and the keyword
 // fallback is unreachable.
 const MIN_RECALL_SCORE = 0.55;
 const STALE_DAYS = 90;
+// Retained only so the legacy implementation below remains buildable while
+// deployments migrate. It is deliberately unreachable from fetch/scheduled.
+const CONSOLIDATION_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast";
 const MAX_CONSOLIDATION_BATCHES = 20;
+const INDEX_BATCH_SIZE = 25;
 
 const DEFAULT_CATEGORIES = [
   "people",
@@ -72,12 +110,32 @@ async function embed(ai: Ai, text: string): Promise<number[]> {
   return (resp as any).data[0];
 }
 
+function safeJsonArray(value: string | null): string[] {
+  try {
+    const parsed = JSON.parse(value || "[]");
+    return Array.isArray(parsed) ? parsed.filter((item) => typeof item === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function safeNumberArray(value: string | null): number[] {
+  try {
+    const parsed = JSON.parse(value || "[]");
+    return Array.isArray(parsed)
+      ? parsed.map(Number).filter((item) => Number.isSafeInteger(item))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
 function formatMemory(m: Memory) {
   return {
     id: m.id,
     content: m.content,
     category: m.category,
-    tags: JSON.parse(m.tags || "[]"),
+    tags: safeJsonArray(m.tags),
     importance: m.importance,
     source: m.source,
     pinned: !!m.pinned,
@@ -86,9 +144,134 @@ function formatMemory(m: Memory) {
     created_at: m.created_at,
     updated_at: m.updated_at,
     consolidated_from: m.consolidated_from
-      ? JSON.parse(m.consolidated_from)
+      ? safeNumberArray(m.consolidated_from)
       : null,
+    status: m.status,
+    record_version: m.record_version,
+    indexed_version: m.indexed_version,
+    index_status: m.index_status,
   };
+}
+
+async function markOutboxFailure(env: Env, item: IndexOutboxItem, error: unknown) {
+  const message = error instanceof Error ? error.message.slice(0, 500) : "Unknown indexing error";
+  const delayMinutes = Math.min(2 ** Math.min(item.attempts, 8), 360);
+  await env.DB.prepare(
+    `UPDATE index_outbox
+     SET state = 'failed', last_error = ?, next_attempt_at = datetime('now', ?), locked_at = NULL
+     WHERE id = ?`
+  )
+    .bind(message, `+${delayMinutes} minutes`, item.id)
+    .run();
+  const current = await env.DB.prepare("SELECT record_version FROM memories WHERE id = ?")
+    .bind(item.memory_id)
+    .first<{ record_version: number }>();
+  if (current?.record_version === item.record_version) {
+    await env.DB.prepare("UPDATE memories SET index_status = 'failed' WHERE id = ?")
+      .bind(item.memory_id)
+      .run();
+  }
+}
+
+async function processIndexOutbox(
+  env: Env,
+  memoryId?: number,
+  limit = INDEX_BATCH_SIZE
+): Promise<{ processed: number; failed: number }> {
+  let query = `SELECT * FROM index_outbox
+    WHERE (
+      (state IN ('pending', 'failed') AND (next_attempt_at IS NULL OR next_attempt_at <= datetime('now')))
+      OR (state = 'processing' AND locked_at < datetime('now', '-10 minutes'))
+    )`;
+  const binds: number[] = [];
+  if (memoryId !== undefined) {
+    query += " AND memory_id = ?";
+    binds.push(memoryId);
+  }
+  query += " ORDER BY created_at ASC, id ASC LIMIT ?";
+  binds.push(limit);
+  const { results } = await env.DB.prepare(query).bind(...binds).all<IndexOutboxItem>();
+  let processed = 0;
+  let failed = 0;
+
+  for (const candidate of results || []) {
+    const item = await env.DB.prepare(
+      `UPDATE index_outbox
+       SET state = 'processing', attempts = attempts + 1, last_error = NULL, locked_at = datetime('now')
+       WHERE id = ? AND (
+         state IN ('pending', 'failed')
+         OR (state = 'processing' AND locked_at < datetime('now', '-10 minutes'))
+       )
+       RETURNING *`
+    )
+      .bind(candidate.id)
+      .first<IndexOutboxItem>();
+    if (!item) continue;
+
+    try {
+      if (item.operation === "delete") {
+        await env.VECTORIZE.deleteByIds([item.memory_id.toString()]);
+      } else {
+        const memory = await env.DB.prepare("SELECT * FROM memories WHERE id = ?")
+          .bind(item.memory_id)
+          .first<Memory>();
+        if (!memory || memory.record_version !== item.record_version) {
+          await env.DB.prepare(
+            "UPDATE index_outbox SET state = 'complete', completed_at = datetime('now'), locked_at = NULL WHERE id = ?"
+          )
+            .bind(item.id)
+            .run();
+          processed++;
+          continue;
+        }
+        const hash = memory.content_hash || (await contentHash(memory.content));
+        if (!memory.content_hash) {
+          await env.DB.batch([
+            env.DB.prepare("UPDATE memories SET content_hash = ? WHERE id = ?").bind(
+              hash,
+              memory.id
+            ),
+            env.DB.prepare(
+              "UPDATE OR IGNORE memories SET dedupe_key = ? WHERE id = ? AND dedupe_key IS NULL"
+            ).bind(hash, memory.id),
+          ]);
+        }
+        const vector = await embed(env.AI, memory.content);
+        await env.VECTORIZE.upsert([
+          {
+            id: memory.id.toString(),
+            values: vector,
+            metadata: {
+              category: memory.category,
+              source: memory.source,
+              importance: memory.importance,
+              status: memory.status,
+              record_version: memory.record_version,
+              content_hash: hash,
+              timestamp: Date.now(),
+            },
+          },
+        ]);
+        await env.DB.prepare(
+          `UPDATE memories SET indexed_version = ?, index_status = 'ready'
+           WHERE id = ? AND record_version = ?`
+        )
+          .bind(memory.record_version, memory.id, memory.record_version)
+          .run();
+      }
+      await env.DB.prepare(
+        "UPDATE index_outbox SET state = 'complete', completed_at = datetime('now'), next_attempt_at = NULL, locked_at = NULL WHERE id = ?"
+      )
+        .bind(item.id)
+        .run();
+      processed++;
+    } catch (error) {
+      failed++;
+      await markOutboxFailure(env, item, error);
+    }
+  }
+
+  return { processed, failed };
 }
 
 function intParam(
@@ -124,98 +307,150 @@ async function recallMemories(
 ): Promise<any[]> {
   const queryVector = await embed(env.AI, query);
   const queryOptions: VectorizeQueryOptions = {
-    topK: limit,
+    topK: Math.min(Math.max(limit * 8, 20), 100),
     returnMetadata: "all",
   };
   if (category) queryOptions.filter = { category };
 
   const vectorResults = await env.VECTORIZE.query(queryVector, queryOptions);
-  const matches = (vectorResults.matches || []).filter(
-    (m) => m.score >= MIN_RECALL_SCORE
-  );
+  const matches = (vectorResults.matches || []).filter((m) => m.score >= MIN_RECALL_SCORE);
+  const candidates = new Map<number, RecallCandidate>();
 
-  if (matches.length === 0) {
-    // Fallback: keyword search
-    let fallbackQuery = "SELECT * FROM memories WHERE content LIKE ?";
-    const fallbackBinds: any[] = [`%${query}%`];
-    if (category) {
-      fallbackQuery += " AND category = ?";
-      fallbackBinds.push(category);
+  if (matches.length > 0) {
+    const ids = matches.map((match) => Number(match.id)).filter(Number.isSafeInteger);
+    if (ids.length > 0) {
+      const ph = ids.map(() => "?").join(",");
+      const { results } = await env.DB.prepare(
+        `SELECT * FROM memories WHERE id IN (${ph}) AND status = 'active'`
+      )
+        .bind(...ids)
+        .all<Memory>();
+      const byId = new Map((results || []).map((memory) => [memory.id, memory]));
+      for (const match of matches) {
+        const id = Number(match.id);
+        const memory = byId.get(id);
+        if (!memory) continue;
+        const metadata = (match.metadata || {}) as Record<string, unknown>;
+        // v3 vectors are accepted only when they describe the current D1 version.
+        if (!isProjectionCurrent(memory, metadata)) {
+          continue;
+        }
+        candidates.set(id, { memory, semanticScore: match.score, lexicalScore: 0 });
+      }
     }
-    fallbackQuery += " ORDER BY importance DESC, created_at DESC LIMIT ?";
-    fallbackBinds.push(limit);
-    const { results } = await env.DB.prepare(fallbackQuery)
-      .bind(...fallbackBinds)
-      .all();
-
-    if (!results || results.length === 0) return [];
-    await touchAccess(
-      env.DB,
-      (results as unknown as Memory[]).map((m) => m.id)
-    );
-    return (results as unknown as Memory[]).map((m) => ({
-      ...formatMemory(m),
-      score: null,
-      match_type: "keyword",
-    }));
   }
 
-  // Fetch full records from D1
-  const ids = matches.map((m) => m.id);
-  const ph = ids.map(() => "?").join(",");
-  const { results: memories } = await env.DB.prepare(
-    `SELECT * FROM memories WHERE id IN (${ph})`
-  )
-    .bind(...ids)
-    .all();
+  // Always union lexical candidates with semantic candidates. FTS keeps D1-only
+  // records discoverable while their Vectorize projection is pending or failed.
+  const tokens = (query.toLowerCase().match(/[\p{L}\p{N}_-]+/gu) || [])
+    .filter((token) => token.length > 1)
+    .slice(0, 12);
+  const lexicalLimit = Math.min(Math.max(limit * 8, 20), 100);
+  let lexicalMemories: Memory[] = [];
+  if (tokens.length > 0) {
+    const ftsQuery = tokens.map((token) => `"${token.replace(/"/g, '""')}"`).join(" OR ");
+    try {
+      let sql = `SELECT m.* FROM memory_fts
+        JOIN memories m ON m.id = memory_fts.rowid
+        WHERE memory_fts MATCH ? AND m.status = 'active'`;
+      const binds: unknown[] = [ftsQuery];
+      if (category) {
+        sql += " AND m.category = ?";
+        binds.push(category);
+      }
+      sql += " ORDER BY bm25(memory_fts) LIMIT ?";
+      binds.push(lexicalLimit);
+      const { results } = await env.DB.prepare(sql).bind(...binds).all<Memory>();
+      lexicalMemories = results || [];
+    } catch {
+      // Compatibility fallback for deployments that have not run the v3 FTS migration.
+      const clauses = tokens.map(() => "lower(content) LIKE ?").join(" OR ");
+      let sql = `SELECT * FROM memories WHERE status = 'active' AND (${clauses})`;
+      const binds: unknown[] = tokens.map((token) => `%${token}%`);
+      if (category) {
+        sql += " AND category = ?";
+        binds.push(category);
+      }
+      sql += " ORDER BY updated_at DESC LIMIT ?";
+      binds.push(lexicalLimit);
+      const { results } = await env.DB.prepare(sql).bind(...binds).all<Memory>();
+      lexicalMemories = results || [];
+    }
+  }
 
-  await touchAccess(
-    env.DB,
-    ((memories as unknown as Memory[]) || []).map((m) => m.id)
-  );
+  lexicalMemories.forEach((memory, index) => {
+    const lexicalScore = 1 - index / Math.max(lexicalMemories.length, 1) * 0.3;
+    const existing = candidates.get(memory.id);
+    if (existing) existing.lexicalScore = lexicalScore;
+    else candidates.set(memory.id, { memory, semanticScore: 0, lexicalScore });
+  });
 
-  return matches
-    .map((match) => {
-      const memory = (memories as unknown as Memory[])?.find(
-        (m) => m.id.toString() === match.id
+  const ranked = [...candidates.values()]
+    .map(({ memory, semanticScore, lexicalScore }) => {
+      const weightedScore = scoreRecallCandidate(
+        semanticScore,
+        lexicalScore,
+        memory.importance
       );
-      if (!memory) return null;
-      const importanceBoost = memory.importance / 5;
-      const weightedScore = match.score * 0.7 + importanceBoost * 0.3;
       return {
         ...formatMemory(memory),
-        score: Math.round(match.score * 100) / 100,
+        score: semanticScore > 0 ? Math.round(semanticScore * 100) / 100 : null,
+        lexical_score: lexicalScore > 0 ? Math.round(lexicalScore * 100) / 100 : null,
         weighted_score: Math.round(weightedScore * 100) / 100,
-        match_type: "semantic",
+        match_type:
+          semanticScore > 0 && lexicalScore > 0
+            ? "hybrid"
+            : semanticScore > 0
+              ? "semantic"
+              : "lexical",
       };
     })
-    .filter(Boolean)
-    .sort((a: any, b: any) => b.weighted_score - a.weighted_score);
+    .sort((a, b) => b.weighted_score - a.weighted_score)
+    .slice(0, limit);
+
+  await touchAccess(env.DB, ranked.map((result) => result.id));
+  return ranked;
 }
 
 // ── Shared Dedup Check (used by REST + MCP) ──────────────────────────
 async function findDuplicate(
   env: Env,
-  vector: number[]
-): Promise<{ memory: Memory; similarity: number } | null> {
+  vector: number[],
+  hash: string,
+  category: string
+): Promise<{ memory: Memory; similarity: number; kind: "exact" | "related" } | null> {
+  const exact = await env.DB.prepare(
+    "SELECT * FROM memories WHERE content_hash = ? AND status = 'active' ORDER BY id ASC LIMIT 1"
+  )
+    .bind(hash)
+    .first<Memory>();
+  if (exact) return { memory: exact, similarity: 1, kind: "exact" };
+
   const similar = await env.VECTORIZE.query(vector, {
-    topK: 3,
+    topK: 10,
     returnMetadata: "all",
+    filter: { category },
   });
-  const dupes = (similar.matches || []).filter(
-    (m) => m.score >= SIMILARITY_THRESHOLD
-  );
-  if (dupes.length === 0) return null;
-  const ids = dupes.map((d) => d.id);
+  const matches = (similar.matches || []).filter((m) => m.score >= SIMILARITY_THRESHOLD);
+  if (matches.length === 0) return null;
+  const ids = matches.map((match) => match.id);
   const ph = ids.map(() => "?").join(",");
   const { results } = await env.DB.prepare(
-    `SELECT * FROM memories WHERE id IN (${ph})`
+    `SELECT * FROM memories WHERE id IN (${ph}) AND status = 'active'`
   )
     .bind(...ids)
-    .all();
-  const existing = (results as unknown as Memory[])[0];
-  if (!existing) return null;
-  return { memory: existing, similarity: dupes[0].score };
+    .all<Memory>();
+  const byId = new Map((results || []).map((memory) => [memory.id.toString(), memory]));
+  for (const match of matches) {
+    const existing = byId.get(match.id);
+    if (!existing) continue;
+    const metadata = (match.metadata || {}) as Record<string, unknown>;
+    if (!isProjectionCurrent(existing, metadata)) {
+      continue;
+    }
+    return { memory: existing, similarity: match.score, kind: "related" };
+  }
+  return null;
 }
 
 // ── Shared Stats (used by REST + MCP) ────────────────────────────────
@@ -229,30 +464,36 @@ async function getStatsData(env: Env, categories: string[]) {
     oldest,
     newest,
     mostAccessed,
+    indexBacklog,
   ] = await env.DB.batch([
-    env.DB.prepare("SELECT COUNT(*) as count FROM memories"),
+    env.DB.prepare("SELECT COUNT(*) as count FROM memories WHERE status = 'active'"),
     env.DB.prepare(
-      "SELECT category, COUNT(*) as count FROM memories GROUP BY category ORDER BY count DESC"
+      "SELECT category, COUNT(*) as count FROM memories WHERE status = 'active' GROUP BY category ORDER BY count DESC"
     ),
     env.DB.prepare(
-      "SELECT source, COUNT(*) as count FROM memories GROUP BY source ORDER BY count DESC"
+      "SELECT source, COUNT(*) as count FROM memories WHERE status = 'active' GROUP BY source ORDER BY count DESC"
     ),
     env.DB.prepare(
-      "SELECT importance, COUNT(*) as count FROM memories GROUP BY importance ORDER BY importance DESC"
+      "SELECT importance, COUNT(*) as count FROM memories WHERE status = 'active' GROUP BY importance ORDER BY importance DESC"
     ),
     env.DB.prepare(
       `SELECT COUNT(*) as count FROM memories
-       WHERE (last_accessed_at IS NOT NULL AND last_accessed_at < datetime('now', '-90 days'))
-          OR (last_accessed_at IS NULL AND created_at < datetime('now', '-90 days'))`
+       WHERE status = 'active' AND (
+         (last_accessed_at IS NOT NULL AND last_accessed_at < datetime('now', '-90 days'))
+         OR (last_accessed_at IS NULL AND created_at < datetime('now', '-90 days'))
+       )`
     ),
     env.DB.prepare(
-      "SELECT created_at FROM memories ORDER BY created_at ASC LIMIT 1"
+      "SELECT created_at FROM memories WHERE status = 'active' ORDER BY created_at ASC LIMIT 1"
     ),
     env.DB.prepare(
-      "SELECT created_at FROM memories ORDER BY created_at DESC LIMIT 1"
+      "SELECT created_at FROM memories WHERE status = 'active' ORDER BY created_at DESC LIMIT 1"
     ),
     env.DB.prepare(
-      "SELECT id, content, access_count FROM memories ORDER BY access_count DESC LIMIT 3"
+      "SELECT id, content, access_count FROM memories WHERE status = 'active' ORDER BY access_count DESC LIMIT 3"
+    ),
+    env.DB.prepare(
+      "SELECT state, COUNT(*) as count FROM index_outbox WHERE state <> 'complete' GROUP BY state"
     ),
   ]);
 
@@ -265,6 +506,7 @@ async function getStatsData(env: Env, categories: string[]) {
     oldest_memory: (oldest.results[0] as any)?.created_at || null,
     newest_memory: (newest.results[0] as any)?.created_at || null,
     most_accessed: mostAccessed.results,
+    index_backlog: indexBacklog.results,
     categories_configured: categories,
   };
 }
@@ -277,8 +519,10 @@ async function getStaleMemories(
 ): Promise<Memory[]> {
   const { results } = await env.DB.prepare(
     `SELECT * FROM memories
-     WHERE (last_accessed_at IS NOT NULL AND last_accessed_at < datetime('now', ?))
-        OR (last_accessed_at IS NULL AND created_at < datetime('now', ?))
+     WHERE status = 'active' AND (
+       (last_accessed_at IS NOT NULL AND last_accessed_at < datetime('now', ?))
+       OR (last_accessed_at IS NULL AND created_at < datetime('now', ?))
+     )
      ORDER BY importance ASC, created_at ASC LIMIT ?`
   )
     .bind(`-${days} days`, `-${days} days`, limit)
@@ -288,12 +532,20 @@ async function getStaleMemories(
 
 // ── CORS & Response Helpers ──────────────────────────────────────────
 function cors(request: Request): Record<string, string> {
-  return {
-    "Access-Control-Allow-Origin": request.headers.get("Origin") || "*",
+  const origin = request.headers.get("Origin");
+  const ownOrigin = new URL(request.url).origin;
+  const headers: Record<string, string> = {
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
     "Access-Control-Max-Age": "86400",
+    Vary: "Origin",
   };
+  // Same-origin browser access is enabled by default. Cross-origin clients
+  // should use MCP or a non-browser HTTP client rather than reflected CORS.
+  if (origin === ownOrigin) {
+    headers["Access-Control-Allow-Origin"] = origin;
+  }
+  return headers;
 }
 
 function jsonResp(data: any, request: Request, status = 200): Response {
@@ -327,6 +579,17 @@ async function handleApi(
     return jsonResp(await getStatsData(env, categories), request);
   }
 
+  if (path === "/api/index/reconcile" && method === "POST") {
+    const body = (await request.json().catch(() => ({}))) as { limit?: unknown };
+    let limit: number;
+    try {
+      limit = positiveInt(body.limit, INDEX_BATCH_SIZE, 100);
+    } catch (error) {
+      return apiError(error instanceof Error ? error.message : "Invalid request", request);
+    }
+    return jsonResp(await processIndexOutbox(env, undefined, limit), request);
+  }
+
   // GET /api/stale?days=90&limit=20
   if (path === "/api/stale" && method === "GET") {
     const days = intParam(url, "days", 90);
@@ -338,9 +601,15 @@ async function handleApi(
   // POST /api/recall
   if (path === "/api/recall" && method === "POST") {
     const body = (await request.json()) as any;
-    const { query, category, limit: rawLimit } = body;
-    if (!query) return apiError("query is required", request);
-    const limit = Math.min(rawLimit || 10, 20);
+    let query: string;
+    let limit: number;
+    try {
+      query = validateQuery(body.query);
+      limit = positiveInt(body.limit, 10, 20);
+    } catch (error) {
+      return apiError(error instanceof Error ? error.message : "Invalid request", request);
+    }
+    const { category } = body;
 
     if (category && !categories.includes(category)) {
       return apiError(
@@ -353,6 +622,19 @@ async function handleApi(
   }
 
   // ── Memory CRUD: /api/memories ────────────────────────────────────
+  const versionsMatch = path.match(/^\/api\/memories\/(\d+)\/versions$/);
+  if (versionsMatch && method === "GET") {
+    const memoryId = Number(versionsMatch[1]);
+    const { results } = await env.DB.prepare(
+      `SELECT memory_id, record_version, content, category, tags, importance,
+        source, pinned, status, content_hash, change_kind, recorded_at
+       FROM memory_versions WHERE memory_id = ? ORDER BY record_version DESC`
+    )
+      .bind(memoryId)
+      .all();
+    return jsonResp({ memory_id: memoryId, versions: results || [] }, request);
+  }
+
   const memoryMatch = path.match(/^\/api\/memories(?:\/(\d+))?$/);
   if (memoryMatch) {
     const id = memoryMatch[1] ? parseInt(memoryMatch[1]) : null;
@@ -366,12 +648,12 @@ async function handleApi(
       const order =
         url.searchParams.get("order") === "asc" ? "ASC" : "DESC";
 
-      let query = "SELECT * FROM memories";
+      let query = "SELECT * FROM memories WHERE status = 'active'";
       const binds: any[] = [];
       if (category) {
         if (!categories.includes(category))
           return apiError("Invalid category", request);
-        query += " WHERE category = ?";
+        query += " AND category = ?";
         binds.push(category);
       }
 
@@ -389,10 +671,10 @@ async function handleApi(
         .bind(...binds)
         .all();
 
-      let countQuery = "SELECT COUNT(*) as count FROM memories";
+      let countQuery = "SELECT COUNT(*) as count FROM memories WHERE status = 'active'";
       const countBinds: any[] = [];
       if (category) {
-        countQuery += " WHERE category = ?";
+        countQuery += " AND category = ?";
         countBinds.push(category);
       }
       const total = await env.DB.prepare(countQuery)
@@ -424,48 +706,53 @@ async function handleApi(
     // POST /api/memories — store
     if (method === "POST" && !id) {
       const body = (await request.json()) as any;
-      const {
-        content,
-        category = "general",
-        tags = [],
-        importance = 3,
-        source = "api",
-        force = false,
-      } = body;
-      if (!content) return apiError("content is required", request);
+      let content: string;
+      let tags: string[];
+      try {
+        content = validateContent(body.content);
+        tags = normalizeTags(body.tags ?? []);
+      } catch (error) {
+        return apiError(error instanceof Error ? error.message : "Invalid request", request);
+      }
+      const category = body.category ?? "general";
+      const importance = body.importance ?? 3;
+      const source = body.source ?? "api";
+      const force = body.force === true;
+      const pinned = body.pinned === true;
       if (!categories.includes(category))
         return apiError(
           `Invalid category "${category}". Available: ${categories.join(", ")}`,
           request
         );
-      if (importance < 1 || importance > 5)
-        return apiError("importance must be 1-5", request);
+      if (!Number.isInteger(importance) || importance < 1 || importance > 5)
+        return apiError("importance must be an integer from 1-5", request);
+      if (![...SOURCES, "web"].includes(source))
+        return apiError("Invalid source", request);
 
       const vector = await embed(env.AI, content);
+      const hash = await contentHash(content);
 
-      // Dedup check
-      if (!force) {
-        const dupe = await findDuplicate(env, vector);
-        if (dupe) {
+      // Only exact normalized duplicates are blocked. Semantic similarity is
+      // advisory because a correction can be close to the claim it replaces.
+      const dupe = await findDuplicate(env, vector, hash, category);
+      if (!force && dupe?.kind === "exact") {
           return jsonResp(
             {
               duplicate: true,
               existing_id: dupe.memory.id,
               existing_content: dupe.memory.content,
-              similarity: Math.round(dupe.similarity * 100),
+              similarity: 100,
               message:
-                "Similar memory exists. Send force=true to store anyway.",
+                "Exact normalized memory already exists. Send force=true to store a separate copy.",
             },
             request,
             409
           );
-        }
       }
 
-      // force=true means "I know it looks similar, keep it separate" —
-      // pin it so nightly consolidation never merges it away.
+      // `force` and `pinned` are independent decisions in v3.
       const result = await env.DB.prepare(
-        "INSERT INTO memories (content, category, tags, importance, source, pinned) VALUES (?, ?, ?, ?, ?, ?) RETURNING *"
+        "INSERT OR IGNORE INTO memories (content, category, tags, importance, source, pinned, content_hash, dedupe_key, index_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending') RETURNING *"
       )
         .bind(
           content,
@@ -473,38 +760,68 @@ async function handleApi(
           JSON.stringify(tags),
           importance,
           source,
-          force ? 1 : 0
+          pinned ? 1 : 0,
+          hash,
+          force ? null : hash
         )
         .first<Memory>();
 
-      if (!result)
+      if (!result) {
+        const concurrent = await env.DB.prepare(
+          "SELECT id, content FROM memories WHERE dedupe_key = ? AND status = 'active' LIMIT 1"
+        )
+          .bind(hash)
+          .first<{ id: number; content: string }>();
+        if (concurrent) {
+          return jsonResp(
+            {
+              duplicate: true,
+              existing_id: concurrent.id,
+              existing_content: concurrent.content,
+              similarity: 100,
+              message: "Exact memory was stored concurrently.",
+            },
+            request,
+            409
+          );
+        }
         return apiError("Failed to store memory", request, 500);
+      }
 
-      await env.VECTORIZE.upsert([
+      await processIndexOutbox(env, result.id, 5);
+      const stored = await env.DB.prepare("SELECT * FROM memories WHERE id = ?")
+        .bind(result.id)
+        .first<Memory>();
+      return jsonResp(
         {
-          id: result.id.toString(),
-          values: vector,
-          metadata: {
-            category,
-            source,
-            importance,
-            timestamp: Date.now(),
-          },
+          ...formatMemory(stored || result),
+          related_memory:
+            dupe?.kind === "related"
+              ? {
+                  id: dupe.memory.id,
+                  content: dupe.memory.content,
+                  similarity: Math.round(dupe.similarity * 100),
+                  message: "Review as a possible duplicate, correction, or contradiction.",
+                }
+              : null,
         },
-      ]);
-
-      return jsonResp(formatMemory(result), request, 201);
+        request,
+        201
+      );
     }
 
     // PUT /api/memories/:id — update
     if (method === "PUT" && id) {
       const body = (await request.json()) as any;
-      const { content, category, tags, importance } = body;
+      const { category } = body;
 
       if (category && !categories.includes(category))
         return apiError("Invalid category", request);
-      if (importance !== undefined && (importance < 1 || importance > 5))
-        return apiError("importance must be 1-5", request);
+      if (
+        body.importance !== undefined &&
+        (!Number.isInteger(body.importance) || body.importance < 1 || body.importance > 5)
+      )
+        return apiError("importance must be an integer from 1-5", request);
 
       const existing = await env.DB.prepare(
         "SELECT * FROM memories WHERE id = ?"
@@ -514,40 +831,41 @@ async function handleApi(
       if (!existing)
         return apiError("Memory not found", request, 404);
 
-      const newContent = content ?? existing.content;
+      let newContent = existing.content;
+      let newTags = existing.tags;
+      try {
+        if (body.content !== undefined) newContent = validateContent(body.content);
+        if (body.tags !== undefined) newTags = JSON.stringify(normalizeTags(body.tags));
+      } catch (error) {
+        return apiError(error instanceof Error ? error.message : "Invalid request", request);
+      }
       const newCategory = category ?? existing.category;
-      const newTags =
-        tags !== undefined ? JSON.stringify(tags) : existing.tags;
-      const newImportance = importance ?? existing.importance;
+      const newImportance = body.importance ?? existing.importance;
+      const newHash = await contentHash(newContent);
+      if (existing.dedupe_key !== null) {
+        const conflict = await env.DB.prepare(
+          "SELECT id FROM memories WHERE dedupe_key = ? AND id <> ? AND status = 'active' LIMIT 1"
+        )
+          .bind(newHash, id)
+          .first<{ id: number }>();
+        if (conflict) {
+          return apiError(`Update would duplicate memory ${conflict.id}`, request, 409);
+        }
+      }
 
       await env.DB.prepare(
-        `UPDATE memories SET content = ?, category = ?, tags = ?, importance = ?, updated_at = datetime('now') WHERE id = ?`
+        `UPDATE memories SET content = ?, category = ?, tags = ?, importance = ?,
+          content_hash = ?, dedupe_key = CASE WHEN dedupe_key IS NULL THEN NULL ELSE ? END,
+          record_version = record_version + 1,
+          index_status = 'pending', updated_at = datetime('now') WHERE id = ?`
       )
-        .bind(newContent, newCategory, newTags, newImportance, id)
+        .bind(newContent, newCategory, newTags, newImportance, newHash, newHash, id)
         .run();
 
       // Re-upsert when content OR vector metadata changed — Vectorize has
       // no metadata-only update, and stale category metadata silently
       // breaks category-filtered recall.
-      if (
-        content ||
-        newCategory !== existing.category ||
-        newImportance !== existing.importance
-      ) {
-        const vector = await embed(env.AI, newContent);
-        await env.VECTORIZE.upsert([
-          {
-            id: id.toString(),
-            values: vector,
-            metadata: {
-              category: newCategory,
-              source: existing.source,
-              importance: newImportance,
-              timestamp: Date.now(),
-            },
-          },
-        ]);
-      }
+      await processIndexOutbox(env, id, 5);
 
       const updated = await env.DB.prepare(
         "SELECT * FROM memories WHERE id = ?"
@@ -567,10 +885,14 @@ async function handleApi(
       if (!existing)
         return apiError("Memory not found", request, 404);
 
-      await env.DB.prepare("DELETE FROM memories WHERE id = ?")
-        .bind(id)
-        .run();
-      await env.VECTORIZE.deleteByIds([id.toString()]);
+      await env.DB.batch([
+        env.DB.prepare("DELETE FROM memories WHERE id = ?").bind(id),
+        env.DB.prepare("DELETE FROM memory_versions WHERE memory_id = ?").bind(id),
+        env.DB.prepare(
+          "DELETE FROM memories_archive WHERE original_id = ? OR consolidated_into = ?"
+        ).bind(id, id),
+      ]);
+      await processIndexOutbox(env, id, 5);
 
       return jsonResp({ deleted: true, id }, request);
     }
@@ -585,7 +907,7 @@ async function handleApi(
       50
     );
     const { results } = await env.DB.prepare(
-      `SELECT * FROM memories WHERE tags LIKE ? ORDER BY importance DESC, created_at DESC LIMIT ?`
+      `SELECT * FROM memories WHERE status = 'active' AND tags LIKE ? ORDER BY importance DESC, created_at DESC LIMIT ?`
     )
       .bind(`%"${tag}"%`, limit)
       .all();
@@ -615,17 +937,19 @@ function createServer(env: Env) {
 
   // ── store_memory ──────────────────────────────────────────────────
   server.tool("store_memory", TOOL_DESC.store, {
-    content: z.string().describe("The memory content to store"),
+    content: z.string().trim().min(1).max(MAX_CONTENT_LENGTH).describe("The memory content to store"),
     category: z
       .string()
       .default("general")
       .describe(`Category: ${categories.join(", ")}`),
     tags: z
-      .array(z.string())
+      .array(z.string().trim().min(1).max(MAX_TAG_LENGTH))
+      .max(MAX_TAGS)
       .default([])
       .describe("Optional tags for filtering"),
     importance: z
       .number()
+      .int()
       .min(1)
       .max(5)
       .default(3)
@@ -640,7 +964,11 @@ function createServer(env: Env) {
       .boolean()
       .default(false)
       .describe("Skip duplicate check and store anyway"),
-  }, async ({ content, category, tags, importance, source, force }) => {
+    pinned: z
+      .boolean()
+      .default(false)
+      .describe("Protect this memory from automated supersession or consolidation"),
+  }, async ({ content, category, tags, importance, source, force, pinned }) => {
     // Validate category
     if (!categories.includes(category)) {
       return {
@@ -655,59 +983,70 @@ function createServer(env: Env) {
 
     // Generate embedding
     const vector = await embed(env.AI, content);
+    const hash = await contentHash(content);
+    const normalizedTags = normalizeTags(tags);
 
     // Dedup check
-    if (!force) {
-      const dupe = await findDuplicate(env, vector);
-      if (dupe) {
+    const dupe = await findDuplicate(env, vector, hash, category);
+    if (!force && dupe?.kind === "exact") {
         return {
           content: [
             {
               type: "text" as const,
-              text: `Similar memory already exists (id: ${dupe.memory.id}, similarity: ${Math.round(dupe.similarity * 100)}%):\n"${dupe.memory.content}"\n\nUse update_memory to modify it, or call store_memory with force=true to store anyway.`,
+              text: `Exact normalized memory already exists (id: ${dupe.memory.id}):\n"${dupe.memory.content}"\n\nUse update_memory to modify it, or call store_memory with force=true to store a separate copy.`,
             },
           ],
         };
-      }
     }
 
-    // Insert into D1 — force=true pins the memory so nightly
-    // consolidation never merges it away.
+    // D1 triggers atomically record the immutable version and outbox event.
     const result = await env.DB.prepare(
-      "INSERT INTO memories (content, category, tags, importance, source, pinned) VALUES (?, ?, ?, ?, ?, ?) RETURNING id"
+      "INSERT OR IGNORE INTO memories (content, category, tags, importance, source, pinned, content_hash, dedupe_key, index_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending') RETURNING id"
     )
       .bind(
         content,
         category,
-        JSON.stringify(tags),
+        JSON.stringify(normalizedTags),
         importance,
         source,
-        force ? 1 : 0
+        pinned ? 1 : 0,
+        hash,
+        force ? null : hash
       )
       .first<{ id: number }>();
 
     if (!result) {
+      const concurrent = await env.DB.prepare(
+        "SELECT id, content FROM memories WHERE dedupe_key = ? AND status = 'active' LIMIT 1"
+      )
+        .bind(hash)
+        .first<{ id: number; content: string }>();
       return {
         content: [
-          { type: "text" as const, text: "Failed to store memory." },
+          {
+            type: "text" as const,
+            text: concurrent
+              ? `Exact memory was stored concurrently (id: ${concurrent.id}):\n"${concurrent.content}"`
+              : "Failed to store memory.",
+          },
         ],
       };
     }
 
-    // Upsert vector
-    await env.VECTORIZE.upsert([
-      {
-        id: result.id.toString(),
-        values: vector,
-        metadata: { category, source, importance, timestamp: Date.now() },
-      },
-    ]);
+    await processIndexOutbox(env, result.id, 5);
+    const indexed = await env.DB.prepare("SELECT index_status FROM memories WHERE id = ?")
+      .bind(result.id)
+      .first<{ index_status: string }>();
 
     return {
       content: [
         {
           type: "text" as const,
-          text: `Memory stored (id: ${result.id}, category: ${category}, importance: ${importance}).`,
+          text: `Memory stored (id: ${result.id}, category: ${category}, importance: ${importance}, index: ${indexed?.index_status || "pending"}).${
+            dupe?.kind === "related"
+              ? ` Related memory ${dupe.memory.id} is ${Math.round(dupe.similarity * 100)}% similar; review it as a possible duplicate, correction, or contradiction.`
+              : ""
+          }`,
         },
       ],
     };
@@ -715,9 +1054,12 @@ function createServer(env: Env) {
 
   // ── update_memory ─────────────────────────────────────────────────
   server.tool("update_memory", TOOL_DESC.update, {
-    id: z.number().describe("The memory ID to update"),
+    id: z.number().int().positive().describe("The memory ID to update"),
     content: z
       .string()
+      .trim()
+      .min(1)
+      .max(MAX_CONTENT_LENGTH)
       .optional()
       .describe("New content (re-embeds automatically)"),
     category: z
@@ -725,11 +1067,13 @@ function createServer(env: Env) {
       .optional()
       .describe("New category"),
     tags: z
-      .array(z.string())
+      .array(z.string().trim().min(1).max(MAX_TAG_LENGTH))
+      .max(MAX_TAGS)
       .optional()
       .describe("New tags (replaces existing)"),
     importance: z
       .number()
+      .int()
       .min(1)
       .max(5)
       .optional()
@@ -763,45 +1107,51 @@ function createServer(env: Env) {
     }
 
     // Build update
-    const newContent = content ?? existing.content;
+    const newContent = content ? validateContent(content) : existing.content;
     const newCategory = category ?? existing.category;
     const newTags =
-      tags !== undefined ? JSON.stringify(tags) : existing.tags;
+      tags !== undefined ? JSON.stringify(normalizeTags(tags)) : existing.tags;
     const newImportance = importance ?? existing.importance;
+    const newHash = await contentHash(newContent);
+    if (existing.dedupe_key !== null) {
+      const conflict = await env.DB.prepare(
+        "SELECT id FROM memories WHERE dedupe_key = ? AND id <> ? AND status = 'active' LIMIT 1"
+      )
+        .bind(newHash, id)
+        .first<{ id: number }>();
+      if (conflict) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Update would duplicate memory ${conflict.id}.`,
+            },
+          ],
+        };
+      }
+    }
 
     await env.DB.prepare(
-      `UPDATE memories SET content = ?, category = ?, tags = ?, importance = ?, updated_at = datetime('now') WHERE id = ?`
+      `UPDATE memories SET content = ?, category = ?, tags = ?, importance = ?,
+        content_hash = ?, dedupe_key = CASE WHEN dedupe_key IS NULL THEN NULL ELSE ? END,
+        record_version = record_version + 1,
+        index_status = 'pending', updated_at = datetime('now') WHERE id = ?`
     )
-      .bind(newContent, newCategory, newTags, newImportance, id)
+      .bind(newContent, newCategory, newTags, newImportance, newHash, newHash, id)
       .run();
 
     // Re-upsert when content OR vector metadata changed — stale category
     // metadata silently breaks category-filtered recall.
-    const needsUpsert =
-      !!content ||
-      newCategory !== existing.category ||
-      newImportance !== existing.importance;
-    if (needsUpsert) {
-      const vector = await embed(env.AI, newContent);
-      await env.VECTORIZE.upsert([
-        {
-          id: id.toString(),
-          values: vector,
-          metadata: {
-            category: newCategory,
-            source: existing.source,
-            importance: newImportance,
-            timestamp: Date.now(),
-          },
-        },
-      ]);
-    }
+    await processIndexOutbox(env, id, 5);
+    const indexed = await env.DB.prepare("SELECT index_status FROM memories WHERE id = ?")
+      .bind(id)
+      .first<{ index_status: string }>();
 
     return {
       content: [
         {
           type: "text" as const,
-          text: `Memory ${id} updated.${needsUpsert ? " (re-embedded)" : ""}`,
+          text: `Memory ${id} updated (version ${existing.record_version + 1}, index: ${indexed?.index_status || "pending"}).`,
         },
       ],
     };
@@ -809,13 +1159,14 @@ function createServer(env: Env) {
 
   // ── recall ────────────────────────────────────────────────────────
   server.tool("recall", TOOL_DESC.recall, {
-    query: z.string().describe("Natural language search query"),
+    query: z.string().trim().min(1).max(2_000).describe("Natural language search query"),
     category: z
       .string()
       .optional()
       .describe("Optional: filter by category"),
     limit: z
       .number()
+      .int()
       .min(1)
       .max(20)
       .default(5)
@@ -858,13 +1209,14 @@ function createServer(env: Env) {
         .describe("Optional: filter by category"),
       limit: z
         .number()
+        .int()
         .min(1)
         .max(50)
         .default(10)
         .describe("Number of memories to return"),
     },
     async ({ category, limit }) => {
-      let query = "SELECT * FROM memories";
+      let query = "SELECT * FROM memories WHERE status = 'active'";
       const binds: any[] = [];
 
       if (category) {
@@ -878,7 +1230,7 @@ function createServer(env: Env) {
             ],
           };
         }
-        query += " WHERE category = ?";
+        query += " AND category = ?";
         binds.push(category);
       }
 
@@ -907,9 +1259,10 @@ function createServer(env: Env) {
     "search_by_tag",
     "Search memories by tag.",
     {
-      tag: z.string().describe("Tag to search for"),
+      tag: z.string().trim().min(1).max(MAX_TAG_LENGTH).describe("Tag to search for"),
       limit: z
         .number()
+        .int()
         .min(1)
         .max(50)
         .default(10)
@@ -917,7 +1270,7 @@ function createServer(env: Env) {
     },
     async ({ tag, limit }) => {
       const { results } = await env.DB.prepare(
-        `SELECT * FROM memories WHERE tags LIKE ? ORDER BY importance DESC, created_at DESC LIMIT ?`
+        `SELECT * FROM memories WHERE status = 'active' AND tags LIKE ? ORDER BY importance DESC, created_at DESC LIMIT ?`
       )
         .bind(`%"${tag}"%`, limit)
         .all();
@@ -943,7 +1296,7 @@ function createServer(env: Env) {
     "forget",
     "Delete a memory by ID. This is permanent.",
     {
-      id: z.number().describe("The memory ID to delete"),
+      id: z.number().int().positive().describe("The memory ID to delete"),
     },
     async ({ id }) => {
       const existing = await env.DB.prepare(
@@ -960,8 +1313,14 @@ function createServer(env: Env) {
         };
       }
 
-      await env.DB.prepare("DELETE FROM memories WHERE id = ?").bind(id).run();
-      await env.VECTORIZE.deleteByIds([id.toString()]);
+      await env.DB.batch([
+        env.DB.prepare("DELETE FROM memories WHERE id = ?").bind(id),
+        env.DB.prepare("DELETE FROM memory_versions WHERE memory_id = ?").bind(id),
+        env.DB.prepare(
+          "DELETE FROM memories_archive WHERE original_id = ? OR consolidated_into = ?"
+        ).bind(id, id),
+      ]);
+      await processIndexOutbox(env, id, 5);
 
       return {
         content: [
@@ -975,11 +1334,13 @@ function createServer(env: Env) {
   server.tool("review_stale", TOOL_DESC.review_stale, {
     days: z
       .number()
+      .int()
       .min(1)
       .default(STALE_DAYS)
       .describe("Number of days without access to consider stale"),
     limit: z
       .number()
+      .int()
       .min(1)
       .max(50)
       .default(20)
@@ -1016,7 +1377,7 @@ function createServer(env: Env) {
 }
 
 // ── Nightly Consolidation (opt-in via cron trigger) ───────────────────
-async function runConsolidation(env: Env) {
+async function unsafeLegacyConsolidationDisabled(env: Env) {
   const processed = new Set<string>();
   let mergeCount = 0;
 
@@ -1197,7 +1558,10 @@ function checkAuth(request: Request, env: Env): Response | null {
 
   const url = new URL(request.url);
   const authHeader = request.headers.get("Authorization");
-  const querySecret = url.searchParams.get("secret");
+  const querySecret =
+    url.pathname === "/mcp" || url.pathname === "/sse"
+      ? url.searchParams.get("secret")
+      : null;
 
   const token = authHeader?.replace("Bearer ", "") || querySecret;
 
@@ -1320,18 +1684,10 @@ textarea{resize:vertical;min-height:80px}
   <div class="login-box">
     <h1>Memory</h1>
     <p>Enter your secret to access your memories.</p>
-    <div id="remoteFields" style="display:none">
-      <label>Server URL</label>
-      <input type="url" id="serverUrl" placeholder="https://your-server.workers.dev">
-      <div class="hint">The URL of your Memory server</div>
-    </div>
     <label>Secret</label>
     <input type="password" id="secretInput" placeholder="Your MEMORY_SECRET">
     <div class="error-msg" id="loginError"></div>
     <button class="btn btn-full" onclick="doLogin()">Connect</button>
-    <div style="text-align:center;margin-top:16px">
-      <button class="btn-ghost btn-sm" id="toggleRemote" onclick="toggleRemote()" style="font-size:12px;padding:6px 12px;border:1px solid var(--border);border-radius:6px;color:var(--text2)">Connect to remote server</button>
-    </div>
   </div>
 </div>
 
@@ -1385,36 +1741,24 @@ let BASE='';let SECRET='';let CATEGORIES=[];let ALL_MEMORIES=[];let CURRENT_CAT=
 
 function getBase(){return BASE||window.location.origin}
 
-function toggleRemote(){
-  const f=document.getElementById('remoteFields');
-  const b=document.getElementById('toggleRemote');
-  if(f.style.display==='none'){f.style.display='block';b.textContent='Use embedded server'}
-  else{f.style.display='none';b.textContent='Connect to remote server'}
-}
-
 async function doLogin(){
-  const urlInput=document.getElementById('serverUrl');
   const secretInput=document.getElementById('secretInput');
   const errEl=document.getElementById('loginError');
   errEl.style.display='none';
   SECRET=secretInput.value.trim();
   if(!SECRET){errEl.textContent='Secret is required';errEl.style.display='block';return}
-  const remoteVisible=document.getElementById('remoteFields').style.display!=='none';
-  if(remoteVisible){
-    BASE=urlInput.value.trim().replace(/\\/$/,'');
-    if(!BASE){errEl.textContent='Server URL is required';errEl.style.display='block';return}
-  }else{BASE=window.location.origin}
+  BASE=window.location.origin;
   try{
     const r=await api('/api/categories');
     CATEGORIES=r.categories;
-    localStorage.setItem('memory_base',BASE);
-    localStorage.setItem('memory_secret',SECRET);
+    sessionStorage.setItem('memory_base',BASE);
+    sessionStorage.setItem('memory_secret',SECRET);
     showApp();
   }catch(e){errEl.textContent=e.message||'Connection failed';errEl.style.display='block'}
 }
 
 function doLogout(){
-  localStorage.removeItem('memory_base');localStorage.removeItem('memory_secret');
+  sessionStorage.removeItem('memory_base');sessionStorage.removeItem('memory_secret');
   document.getElementById('app').style.display='none';
   document.getElementById('loginScreen').style.display='flex';
 }
@@ -1584,10 +1928,10 @@ async function doDelete(){
 
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
 
-// Auto-login from localStorage
+// Auto-login for this browser tab only; the master secret is not persisted.
 (async()=>{
-  const b=localStorage.getItem('memory_base');
-  const s=localStorage.getItem('memory_secret');
+  const b=sessionStorage.getItem('memory_base');
+  const s=sessionStorage.getItem('memory_secret');
   if(s){
     BASE=b||window.location.origin;
     SECRET=s;
@@ -1642,6 +1986,10 @@ export default {
         headers: {
           "Content-Type": "text/html; charset=utf-8",
           "Cache-Control": "no-cache",
+          "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src data:",
+          "Referrer-Policy": "no-referrer",
+          "X-Content-Type-Options": "nosniff",
+          "X-Frame-Options": "DENY",
         },
       });
     }
@@ -1650,13 +1998,19 @@ export default {
     if (url.pathname.startsWith("/api/")) {
       const authResponse = checkAuth(request, env);
       if (authResponse) return authResponse;
+      const contentLength = Number(request.headers.get("Content-Length") || "0");
+      if (Number.isFinite(contentLength) && contentLength > 64 * 1024) {
+        return apiError("Request body exceeds 64 KiB", request, 413);
+      }
       // Unhandled throws become CF 500 HTML pages with no CORS headers,
       // which browsers report as an opaque "failed to fetch".
       try {
         return await handleApi(request, env, url);
       } catch (e: any) {
+        const errorId = crypto.randomUUID();
+        console.error(JSON.stringify({ errorId, path: url.pathname, error: e?.message || String(e) }));
         return jsonResp(
-          { error: e?.message || "Internal error" },
+          { error: "Internal error", error_id: errorId },
           request,
           500
         );
@@ -1682,6 +2036,8 @@ export default {
     env: Env,
     ctx: ExecutionContext
   ): Promise<void> {
-    ctx.waitUntil(runConsolidation(env));
+    // v3 uses the scheduler to repair the D1 -> Vectorize projection. The old
+    // destructive LLM consolidation is intentionally disabled.
+    ctx.waitUntil(processIndexOutbox(env, undefined, 100).then(() => undefined));
   },
 };
